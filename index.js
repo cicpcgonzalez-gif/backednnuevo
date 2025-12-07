@@ -235,3 +235,6 @@ app.listen(PORT, () => {
 });
 
 // Forzar redeploy en Render
+app.get('/', (req, res) => {
+  res.json({ message: 'API de rifas funcionando' });
+});
