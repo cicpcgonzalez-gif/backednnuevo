@@ -189,3 +189,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Servidor backend escuchando en el puerto ${PORT}`);
 });
+
+// Forzar redeploy en Render
