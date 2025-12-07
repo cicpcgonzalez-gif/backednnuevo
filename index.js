@@ -9,15 +9,57 @@ app.use(express.json());
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 
+const SUPERADMIN_EMAIL = 'rifa@megarifasapp.com';
+const SUPERADMIN_PASSWORD = 'rifasadmin123';
+const SUPERADMIN_ROLE = 'superadmin';
+
+async function ensureSuperAdmin() {
+  const existing = await prisma.user.findUnique({ where: { email: SUPERADMIN_EMAIL } });
+  if (!existing) {
+    const hashed = await bcrypt.hash(SUPERADMIN_PASSWORD, 10);
+    await prisma.user.create({
+      data: {
+        email: SUPERADMIN_EMAIL,
+        password: hashed,
+        role: SUPERADMIN_ROLE,
+        name: 'Super Admin',
+      }
+    });
+    console.log('Superadmin creado automáticamente');
+  } else {
+    console.log('Superadmin ya existe');
+  }
+}
+
+function logRequest(req, res, next) {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    console.log(`[${req.method}] ${req.originalUrl} - ${res.statusCode} (${duration}ms)`);
+  });
+  next();
+}
+app.use(logRequest);
+
+ensureSuperAdmin().catch(console.error);
+
 // Endpoint de salud
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok' });
+app.get('/health', async (req, res) => {
+  const start = Date.now();
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    res.json({ status: 'ok', db: 'ok', time: Date.now() - start });
+  } catch (error) {
+    res.status(500).json({ status: 'error', db: 'fail', error: error.message });
+  }
 });
 
 // Endpoint para obtener todos los usuarios
 app.get('/users', async (req, res) => {
+  const start = Date.now();
   try {
     const users = await prisma.user.findMany();
+    console.log('Consulta usuarios:', Date.now() - start, 'ms');
     res.json(users);
   } catch (error) {
     res.status(500).json({ error: 'Error al obtener usuarios' });
@@ -26,8 +68,10 @@ app.get('/users', async (req, res) => {
 
 // Endpoint para obtener todas las rifas
 app.get('/raffles', async (req, res) => {
+  const start = Date.now();
   try {
     const raffles = await prisma.raffle.findMany();
+    console.log('Consulta rifas:', Date.now() - start, 'ms');
     res.json(raffles);
   } catch (error) {
     res.status(500).json({ error: 'Error al obtener rifas' });
