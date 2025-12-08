@@ -304,3 +304,23 @@ app.listen(PORT, () => {
 app.get('/', (req, res) => {
   res.json({ message: 'API de rifas funcionando' });
 });
+
+// Middleware global de manejo de errores (SIEMPRE al final)
+app.use((err, req, res, next) => {
+  console.error('[GLOBAL ERROR HANDLER]', err);
+  // Si el error es de sintaxis JSON (body-parser)
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    return res.status(400).json({ error: 'JSON malformado' });
+  }
+  // Cualquier otro error
+  res.status(err.status || 500).json({
+    error: err.message || 'Error interno del servidor',
+    details: process.env.NODE_ENV === 'development' ? err.stack : undefined
+  });
+});
+
+// Puerto
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Servidor backend escuchando en el puerto ${PORT}`);
+});
