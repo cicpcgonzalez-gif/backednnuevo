@@ -78,6 +78,7 @@ model Raffle {
   id          Int      @id @default(autoincrement())
   title       String
   prize       String
+  terms       String?
   ticketPrice Float    @default(0.0)
   totalTickets Int     @default(10000)
   lottery     String?

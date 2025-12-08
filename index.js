@@ -5,11 +5,45 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const compression = require('compression');
 
 const app = express();
 
 // Security Middleware
 app.use(helmet());
+app.use(compression());
+
+// Simple request logger (method, path, duration)
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    console.log(`[REQ] ${req.method} ${req.originalUrl} ${res.statusCode} ${duration}ms`);
+  });
+  next();
+});
+
+// Global rate limit (applies to all routes)
+const globalLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 min
+  max: 100, // 100 requests/min/IP
+  standardHeaders: true,
+  legacyHeaders: false
+});
+app.use(globalLimiter);
+
+// Default pagination guard for GET requests
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 100;
+app.use((req, res, next) => {
+  if (req.method === 'GET') {
+    const limit = Number(req.query.limit);
+    const offset = Number(req.query.offset);
+    req.query.limit = Number.isFinite(limit) && limit > 0 ? Math.min(limit, MAX_LIMIT) : DEFAULT_LIMIT;
+    req.query.offset = Number.isFinite(offset) && offset >= 0 ? offset : 0;
+  }
+  next();
+});
 
 // Rate Limiter for Login
 const loginLimiter = rateLimit({
@@ -1401,11 +1435,78 @@ app.post('/me/change-password', authenticateToken, async (req, res) => {
   }
 });
 
+// --- USER PROFILE ---
+app.get('/me', authenticateToken, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.userId },
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        role: true,
+        balance: true,
+        avatar: true,
+        bio: true,
+        socials: true,
+        referralCode: true,
+        createdAt: true
+      }
+    });
+    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+    res.json(user);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al obtener perfil' });
+  }
+});
+
+app.patch('/me', authenticateToken, async (req, res) => {
+  try {
+    const { name, avatar, bio, socials } = req.body;
+    const user = await prisma.user.update({
+      where: { id: req.user.userId },
+      data: { name, avatar, bio, socials }
+    });
+    res.json(user);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al actualizar perfil' });
+  }
+});
+
+app.get('/me/tickets', authenticateToken, async (req, res) => {
+  try {
+    const tickets = await prisma.ticket.findMany({
+      where: { userId: req.user.userId },
+      include: { raffle: true },
+      orderBy: { createdAt: 'desc' }
+    });
+    res.json(tickets);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al obtener tickets' });
+  }
+});
+
+app.get('/me/payments', authenticateToken, async (req, res) => {
+  try {
+    const payments = await prisma.transaction.findMany({
+      where: { userId: req.user.userId },
+      orderBy: { createdAt: 'desc' }
+    });
+    res.json(payments);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al obtener pagos' });
+  }
+});
+
 // --- REFERRALS ---
 app.get('/me/referrals', authenticateToken, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({
-      where: { id: req.user.id },
+      where: { id: req.user.userId },
       include: {
         referrals: {
           select: { name: true, createdAt: true, verified: true }
@@ -1434,10 +1535,10 @@ app.post('/me/referral', authenticateToken, async (req, res) => {
     
     const referrer = await prisma.user.findUnique({ where: { referralCode: code } });
     if (!referrer) return res.status(404).json({ error: 'Código inválido' });
-    if (referrer.id === req.user.id) return res.status(400).json({ error: 'No puedes referirte a ti mismo' });
+    if (referrer.id === req.user.userId) return res.status(400).json({ error: 'No puedes referirte a ti mismo' });
 
     await prisma.user.update({
-      where: { id: req.user.id },
+      where: { id: req.user.userId },
       data: { referredById: referrer.id }
     });
 
@@ -1539,7 +1640,7 @@ app.post('/admin/announcements', authenticateToken, authorizeRole(['admin', 'sup
         title,
         content,
         imageUrl,
-        adminId: req.user.id
+        adminId: req.user.userId
       }
     });
     res.json(announcement);
@@ -1561,7 +1662,7 @@ app.post('/announcements/:id/react', authenticateToken, async (req, res) => {
     const existing = await prisma.reaction.findUnique({
       where: {
         userId_announcementId: {
-          userId: req.user.id,
+          userId: req.user.userId,
           announcementId: Number(id)
         }
       }
@@ -1581,7 +1682,7 @@ app.post('/announcements/:id/react', authenticateToken, async (req, res) => {
     } else {
       const reaction = await prisma.reaction.create({
         data: {
-          userId: req.user.id,
+          userId: req.user.userId,
           announcementId: Number(id),
           type
         }
@@ -1610,13 +1711,17 @@ app.patch('/superadmin/settings/smtp', authenticateToken, authorizeRole(['supera
 
 // Puerto
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Servidor backend escuchando en el puerto ${PORT}`);
+app.get('/health', (req, res) => {
+  res.json({ ok: true, status: 'up', timestamp: Date.now() });
 });
 
 // Forzar redeploy en Render
 app.get('/', (req, res) => {
   res.json({ message: 'API de rifas funcionando' });
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Servidor backend escuchando en el puerto ${PORT} (Accesible desde red)`);
 });
 
 // Middleware global de manejo de errores (SIEMPRE al final)
