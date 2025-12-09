@@ -7,14 +7,18 @@ const adminUsers = [
   { email: 'gatorifas.com', password: 'rifasgato123', role: 'admin' },
   { email: 'adrianrifas.com', password: 'rifasadrian123', role: 'admin' },
   { email: 'sergiorifas.com', password: 'rifassergio123', role: 'admin' },
-  { email: 'jesusrifas.com', password: 'rifasjesus123', role: 'admin' }
+  { email: 'jesusrifas.com', password: 'rifasjesus123', role: 'admin' },
+  { email: 'pruebaadmin', password: 'rifas123', role: 'admin' }
 ];
 
 const normalUsers = [
   { email: 'youbarrios', password: 'barrio123', role: 'user' },
   { email: 'amiguita.com', password: 'yuvanelafresa', role: 'user' },
-  { email: 'maholismanao', password: 'macario123', role: 'user' }
+  { email: 'maholismanao', password: 'macario123', role: 'user' },
+  { email: 'pruebauser', password: 'claverifas123', role: 'user' }
 ];
+
+const toDelete = ['gonzalezcicpc@gmail.com', 'cicpcgonzalez@gmail.com'];
 
 function toName(email) {
   return String(email).split('@')[0] || String(email);
@@ -47,6 +51,16 @@ async function upsertUser({ email, password, role }) {
 
 async function main() {
   try {
+    // Delete requested users if they exist
+    for (const email of toDelete) {
+      try {
+        await prisma.user.delete({ where: { email } });
+        console.log(`Deleted user: ${email}`);
+      } catch (err) {
+        if (err.code !== 'P2025') console.warn(`Could not delete ${email}:`, err.message || err);
+      }
+    }
+
     for (const user of [...adminUsers, ...normalUsers]) {
       await upsertUser(user);
     }
