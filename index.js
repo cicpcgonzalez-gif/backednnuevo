@@ -4,6 +4,7 @@ const { PrismaClient, Prisma } = require('@prisma/client');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const helmet = require('helmet');
+const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const compression = require('compression');
 
@@ -11,6 +12,7 @@ const app = express();
 
 // Security Middleware
 app.use(helmet());
+app.use(cors());
 app.use(compression());
 
 // Simple request logger (method, path, duration)
