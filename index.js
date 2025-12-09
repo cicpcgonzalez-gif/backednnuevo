@@ -1127,6 +1127,49 @@ app.post('/admin/security-code/regenerate', authenticateToken, authorizeRole(['a
   res.json({ code });
 });
 
+// --- EMERGENCY DB FIXER ---
+app.get('/admin/system/fix-db', async (req, res) => {
+  try {
+    // 1. Fix Structure (Manual Migration via SQL)
+    // Esto asegura que las columnas existan aunque falle la migración automática
+    await prisma.$executeRawUnsafe(`ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "securityId" TEXT;`);
+    try {
+        await prisma.$executeRawUnsafe(`CREATE UNIQUE INDEX "User_securityId_key" ON "User"("securityId");`);
+    } catch (e) { /* Index might exist */ }
+    await prisma.$executeRawUnsafe(`ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "identityVerified" BOOLEAN DEFAULT false;`);
+    await prisma.$executeRawUnsafe(`ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "reputationScore" DOUBLE PRECISION DEFAULT 5.0;`);
+    
+    // 2. Backfill IDs (Asignar IDs a quienes no tengan)
+    const users = await prisma.user.findMany({ where: { securityId: null } });
+    let updated = 0;
+    
+    for (const user of users) {
+      let securityId = generateSecurityId();
+      // Check collision
+      let exists = await prisma.user.findFirst({ where: { securityId } });
+      while (exists) {
+        securityId = generateSecurityId();
+        exists = await prisma.user.findFirst({ where: { securityId } });
+      }
+      
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { securityId, reputationScore: 5.0, identityVerified: false }
+      });
+      updated++;
+    }
+    
+    res.json({ 
+      success: true, 
+      message: 'Estructura de DB reparada y IDs asignados', 
+      usersUpdated: updated 
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: error.message, stack: error.stack });
+  }
+});
+
 app.post('/raffles/:id/close', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
   // Logic to close raffle and pick winner
   res.json({ message: 'Rifa cerrada' });
