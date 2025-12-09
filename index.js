@@ -2005,6 +2005,35 @@ app.patch('/me', authenticateToken, async (req, res) => {
   }
 });
 
+app.delete('/me', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    // Anonymize user data instead of hard delete to preserve integrity of raffles/transactions
+    await prisma.user.update({
+      where: { id: Number(userId) },
+      data: {
+        name: 'Usuario Eliminado',
+        email: `deleted_${userId}_${Date.now()}@megarifas.deleted`,
+        password: await bcrypt.hash(uuidv4(), 10), // Unusable password
+        active: false,
+        pushToken: null,
+        socials: {},
+        bankDetails: {},
+        bio: null,
+        avatar: null,
+        securityId: null,
+        verificationToken: null
+      }
+    });
+
+    res.json({ message: 'Cuenta eliminada correctamente' });
+  } catch (error) {
+    console.error('Error deleting user:', error);
+    res.status(500).json({ error: 'Error al eliminar la cuenta' });
+  }
+});
+
 app.get('/me/tickets', authenticateToken, async (req, res) => {
   try {
     const tickets = await prisma.ticket.findMany({
