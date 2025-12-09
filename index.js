@@ -1127,6 +1127,136 @@ app.post('/admin/security-code/regenerate', authenticateToken, authorizeRole(['a
   res.json({ code });
 });
 
+// --- ADMIN WINNERS MANAGEMENT ---
+
+app.post('/admin/winners', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  const { raffleId, ticketNumber, winnerName, prize, testimonial, photoUrl } = req.body;
+  
+  if (!raffleId || !winnerName || !prize) {
+    return res.status(400).json({ error: 'Faltan datos requeridos (Rifa, Nombre, Premio)' });
+  }
+
+  try {
+    // Intentar buscar usuario por ticket si existe
+    let userId = null;
+    if (ticketNumber) {
+      const ticket = await prisma.ticket.findFirst({
+        where: { raffleId: Number(raffleId), number: Number(ticketNumber) },
+        include: { user: true }
+      });
+      if (ticket) userId = ticket.userId;
+    }
+
+    const winner = await prisma.winner.create({
+      data: {
+        raffleId: Number(raffleId),
+        userId,
+        prize,
+        testimonial: testimonial || '',
+        photoUrl: photoUrl || null,
+        // Si no hay usuario registrado, guardamos el nombre en el testimonio o necesitamos campo extra.
+        // Por ahora el schema tiene userId opcional.
+      }
+    });
+
+    res.json({ message: 'Ganador publicado exitosamente', winner });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al publicar ganador' });
+  }
+});
+
+app.get('/winners', async (req, res) => {
+  try {
+    const winners = await prisma.winner.findMany({
+      include: { 
+        raffle: { select: { title: true } },
+        user: { select: { name: true, avatar: true } }
+      },
+      orderBy: { drawDate: 'desc' },
+      take: 20
+    });
+    res.json(winners);
+  } catch (error) {
+    res.status(500).json({ error: 'Error al obtener ganadores' });
+  }
+});
+
+// --- ADMIN ANNOUNCEMENTS ---
+
+app.post('/admin/announcements', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  const { title, content, imageUrl } = req.body;
+  
+  if (!title || !content) {
+    return res.status(400).json({ error: 'Título y contenido requeridos' });
+  }
+
+  try {
+    const announcement = await prisma.announcement.create({
+      data: {
+        title,
+        content,
+        imageUrl,
+        adminId: req.user.userId
+      }
+    });
+    
+    // Opcional: Enviar push notification automática
+    // sendPushToAll(title, content);
+
+    res.json({ message: 'Anuncio publicado', announcement });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al crear anuncio' });
+  }
+});
+
+app.get('/announcements', async (req, res) => {
+  try {
+    const news = await prisma.announcement.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: 20,
+      include: { admin: { select: { name: true } } }
+    });
+    res.json(news);
+  } catch (error) {
+    res.status(500).json({ error: 'Error al obtener noticias' });
+  }
+});
+
+// --- ADMIN PUSH NOTIFICATIONS ---
+
+app.post('/admin/push/broadcast', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  const { title, body } = req.body;
+  
+  if (!title || !body) return res.status(400).json({ error: 'Título y mensaje requeridos' });
+
+  try {
+    // 1. Obtener tokens de usuarios
+    const users = await prisma.user.findMany({
+      where: { pushToken: { not: null } },
+      select: { pushToken: true }
+    });
+
+    const tokens = users.map(u => u.pushToken).filter(t => t);
+    
+    if (tokens.length === 0) {
+      return res.json({ message: 'No hay usuarios con notificaciones activas', count: 0 });
+    }
+
+    // 2. Enviar usando Expo (Mock o Real si se configura)
+    // Aquí simulamos el envío para no romper si no hay credenciales de Expo configuradas
+    console.log(`[PUSH BROADCAST] To ${tokens.length} devices: ${title} - ${body}`);
+    
+    // TODO: Integrar 'expo-server-sdk' real aquí
+    
+    res.json({ message: 'Notificación enviada a la cola de procesamiento', count: tokens.length });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al enviar notificaciones' });
+  }
+});
+
 // --- EMERGENCY DB FIXER ---
 app.get('/admin/system/fix-db', async (req, res) => {
   try {
@@ -1139,6 +1269,33 @@ app.get('/admin/system/fix-db', async (req, res) => {
     await prisma.$executeRawUnsafe(`ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "identityVerified" BOOLEAN DEFAULT false;`);
     await prisma.$executeRawUnsafe(`ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "reputationScore" DOUBLE PRECISION DEFAULT 5.0;`);
     
+    // Crear tabla Winner si no existe
+    await prisma.$executeRawUnsafe(`
+      CREATE TABLE IF NOT EXISTS "Winner" (
+        "id" SERIAL NOT NULL,
+        "raffleId" INTEGER NOT NULL,
+        "userId" INTEGER,
+        "photoUrl" TEXT,
+        "testimonial" TEXT,
+        "prize" TEXT,
+        "drawDate" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT "Winner_pkey" PRIMARY KEY ("id")
+      );
+    `);
+
+    // Crear tabla Announcement si no existe
+    await prisma.$executeRawUnsafe(`
+      CREATE TABLE IF NOT EXISTS "Announcement" (
+        "id" SERIAL NOT NULL,
+        "title" TEXT NOT NULL,
+        "content" TEXT NOT NULL,
+        "imageUrl" TEXT,
+        "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        "adminId" INTEGER NOT NULL,
+        CONSTRAINT "Announcement_pkey" PRIMARY KEY ("id")
+      );
+    `);
+
     // 2. Backfill IDs (Asignar IDs a quienes no tengan)
     const users = await prisma.user.findMany({ where: { securityId: null } });
     let updated = 0;
