@@ -416,6 +416,36 @@ app.post('/verify-email', async (req, res) => {
   }
 });
 
+// Reenviar código de verificación
+app.post('/resend-code', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email requerido' });
+
+  try {
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+    if (user.verified) return res.status(400).json({ error: 'Usuario ya verificado' });
+
+    const verificationToken = generateVerificationCode();
+    await prisma.user.update({
+      where: { email },
+      data: { verificationToken }
+    });
+
+    await sendEmail(
+      email,
+      'Reenvío de Código de Verificación',
+      `Tu nuevo código es: ${verificationToken}`,
+      `<h1>Código de Verificación</h1><p>Tu nuevo código es:</p><h2>${verificationToken}</h2>`
+    );
+
+    res.json({ message: 'Código reenviado exitosamente' });
+  } catch (error) {
+    console.error('Error resending code:', error);
+    res.status(500).json({ error: 'Error al reenviar código' });
+  }
+});
+
 // Login de usuario
 app.post('/login', loginLimiter, async (req, res) => {
   const { email, password } = req.body;
@@ -687,7 +717,7 @@ app.get('/users/:id', authenticateToken, async (req, res) => {
 });
 
 app.put('/users/:id', authenticateToken, async (req, res) => {
-  const { name, email } = req.body;
+  const { name, email, phone, address, cedula, dob } = req.body;
   // Solo admin/superadmin o el propio usuario pueden editar
   if (req.user.role !== 'admin' && req.user.role !== 'superadmin' && req.user.userId !== Number(req.params.id)) {
      return res.status(403).json({ error: 'No autorizado para editar este usuario' });
@@ -695,9 +725,14 @@ app.put('/users/:id', authenticateToken, async (req, res) => {
   try {
     const user = await prisma.user.update({
       where: { id: Number(req.params.id) },
-      data: { name, email }
+      data: { name, email, phone, address, cedula, dob }
     });
     res.json({ message: 'Usuario actualizado', user });
+  } catch (error) {
+    console.error('Error updating user:', error);
+    res.status(500).json({ error: 'Error al actualizar usuario: ' + error.message });
+  }
+});
   } catch (error) {
     res.status(500).json({ error: 'Error al actualizar usuario' });
   }
