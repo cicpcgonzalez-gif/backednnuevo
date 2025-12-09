@@ -519,24 +519,24 @@ app.post('/login', loginLimiter, async (req, res) => {
   const valid = await bcrypt.compare(password, user.password);
   if (!valid) return res.status(401).json({ error: 'Contraseña incorrecta' });
 
-  // 2. Seguridad para Admins (2FA)
-  if (user.role === 'admin') {
-    const twoFactorToken = generateVerificationCode();
-    await prisma.user.update({
-      where: { id: user.id },
-      data: { verificationToken: twoFactorToken }
-    });
+  // 2. Seguridad para Admins (2FA) - desactivada temporalmente para pruebas
+  // if (user.role === 'admin') {
+  //   const twoFactorToken = generateVerificationCode();
+  //   await prisma.user.update({
+  //     where: { id: user.id },
+  //     data: { verificationToken: twoFactorToken }
+  //   });
 
-    // Enviar código al admin
-    sendEmail(
-      user.email,
-      'Código de Seguridad (2FA)',
-      `Tu código de acceso es: ${twoFactorToken}`,
-      `<h1>Seguridad MegaRifas</h1><p>Estás intentando acceder como Administrador.</p><p>Tu código es:</p><h2 style="color: #d97706;">${twoFactorToken}</h2>`
-    ).catch(console.error);
+  //   // Enviar código al admin
+  //   sendEmail(
+  //     user.email,
+  //     'Código de Seguridad (2FA)',
+  //     `Tu código de acceso es: ${twoFactorToken}`,
+  //     `<h1>Seguridad MegaRifas</h1><p>Estás intentando acceder como Administrador.</p><p>Tu código es:</p><h2 style="color: #d97706;">${twoFactorToken}</h2>`
+  //   ).catch(console.error);
 
-    return res.json({ require2FA: true, email: user.email, message: 'Código de seguridad enviado' });
-  }
+  //   return res.json({ require2FA: true, email: user.email, message: 'Código de seguridad enviado' });
+  // }
 
   const token = jwt.sign({ userId: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '1h' });
   
