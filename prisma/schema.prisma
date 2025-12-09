@@ -120,6 +120,7 @@ model SystemSettings {
   branding  Json?
   modules   Json?
   smtp      Json?    // { host, port, user, pass, secure, fromName, fromEmail }
+  company   Json?    // { name, address, rif, phone, email }
   updatedAt DateTime @updatedAt
 }
 

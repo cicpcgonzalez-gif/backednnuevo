@@ -126,7 +126,13 @@ let defaultTransporter = nodemailer.createTransport({
 async function sendEmail(to, subject, text, html) {
   try {
     // 1. Buscar configuración SMTP personalizada en DB
-    const settings = await prisma.systemSettings.findFirst();
+    let settings = null;
+    try {
+      settings = await prisma.systemSettings.findFirst();
+    } catch (dbError) {
+      console.warn('Could not fetch SMTP settings from DB, using ENV fallback:', dbError.message);
+    }
+
     let transporter = defaultTransporter;
     let fromAddress = '"MegaRifas" <noreply@megarifasapp.com>';
 
@@ -162,15 +168,23 @@ async function sendEmail(to, subject, text, html) {
     });
 
     console.log('Message sent: %s', info.messageId);
-    await prisma.mailLog.create({
-      data: { to, subject, status: 'SENT', timestamp: new Date() }
-    });
+    try {
+      await prisma.mailLog.create({
+        data: { to, subject, status: 'SENT', timestamp: new Date() }
+      });
+    } catch (logError) {
+      console.warn('Failed to log email sent to DB:', logError.message);
+    }
     return true;
   } catch (error) {
     console.error('Error sending email:', error);
-    await prisma.mailLog.create({
-      data: { to, subject, status: 'FAILED', timestamp: new Date() }
-    });
+    try {
+      await prisma.mailLog.create({
+        data: { to, subject, status: 'FAILED', timestamp: new Date() }
+      });
+    } catch (logError) {
+      console.warn('Failed to log email failure to DB:', logError.message);
+    }
     return false;
   }
 }
@@ -985,6 +999,111 @@ app.put('/admin/bank-details', authenticateToken, authorizeRole(['admin', 'super
 // Endpoint público para ver datos bancarios del admin (para que el usuario pague)
 app.get('/admin/bank-details', async (req, res) => {
   try {
+    // Asumimos que el admin principal es el ID 1 o buscamos por rol
+    const admin = await prisma.user.findFirst({ where: { role: 'superadmin' } });
+    if (!admin || !admin.bankDetails) return res.status(404).json({ error: 'Datos bancarios no disponibles' });
+    res.json(admin.bankDetails);
+  } catch (error) {
+    res.status(500).json({ error: 'Error al obtener datos bancarios' });
+  }
+});
+
+// --- ADMIN RAFFLE MANAGEMENT ---
+
+app.get('/admin/raffles', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const raffles = await prisma.raffle.findMany({ orderBy: { createdAt: 'desc' } });
+    res.json(raffles);
+  } catch (error) {
+    res.status(500).json({ error: 'Error al obtener rifas' });
+  }
+});
+
+app.post('/raffles', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const { title, price, description, totalTickets, startDate, endDate, securityCode, lottery, instantWins, terms } = req.body;
+    const raffle = await prisma.raffle.create({
+      data: {
+        title,
+        prize: description, // Mapping description to prize for now or add description field to schema
+        ticketPrice: Number(price),
+        totalTickets: Number(totalTickets),
+        lottery,
+        terms,
+        style: { instantWins } // Storing instantWins in style JSON for now
+      }
+    });
+    res.json(raffle);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al crear rifa' });
+  }
+});
+
+app.patch('/admin/raffles/:id', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  const { id } = req.params;
+  const data = req.body;
+  try {
+    // Handle style update specifically if nested
+    if (data.style) {
+      const current = await prisma.raffle.findUnique({ where: { id: Number(id) }, select: { style: true } });
+      data.style = { ...(current?.style || {}), ...data.style };
+    }
+    
+    const raffle = await prisma.raffle.update({
+      where: { id: Number(id) },
+      data
+    });
+    res.json(raffle);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al actualizar rifa' });
+  }
+});
+
+app.get('/admin/tickets', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const { raffleId, status, from, to } = req.query;
+    const where = {};
+    if (raffleId) where.raffleId = Number(raffleId);
+    if (status) where.status = status;
+    if (from || to) {
+      where.createdAt = {};
+      if (from) where.createdAt.gte = new Date(from);
+      if (to) where.createdAt.lte = new Date(to);
+    }
+
+    const tickets = await prisma.ticket.findMany({
+      where,
+      include: { user: { select: { email: true, name: true } } },
+      orderBy: { createdAt: 'desc' },
+      take: 1000
+    });
+    res.json(tickets);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al buscar tickets' });
+  }
+});
+
+app.get('/admin/security-code', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  // Mock implementation - in real app store in DB
+  res.json({ code: 'SEC-123', active: true });
+});
+
+app.post('/admin/security-code/regenerate', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  const code = generateShortId('SEC');
+  // Store code in DB...
+  res.json({ code });
+});
+
+app.post('/raffles/:id/close', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  // Logic to close raffle and pick winner
+  res.json({ message: 'Rifa cerrada' });
+});
+
+// --- SUPERADMIN ENDPOINTS ---
+  try {
     // Asumimos que el primer superadmin o admin tiene los datos
     const admin = await prisma.user.findFirst({
       where: { role: { in: ['admin', 'superadmin'] }, bankDetails: { not: Prisma.DbNull } }
@@ -1107,6 +1226,20 @@ app.patch('/superadmin/settings/modules', authenticateToken, authorizeRole(['sup
     res.json(settings);
   } catch (error) {
     res.status(500).json({ error: 'Error al guardar módulos' });
+  }
+});
+
+app.patch('/superadmin/settings/company', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
+  try {
+    const company = req.body;
+    const settings = await prisma.systemSettings.upsert({
+      where: { id: 1 },
+      update: { company },
+      create: { branding: {}, modules: {}, company }
+    });
+    res.json(settings);
+  } catch (error) {
+    res.status(500).json({ error: 'Error al guardar datos de empresa' });
   }
 });
 
