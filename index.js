@@ -379,8 +379,12 @@ async function checkAndRewardReferrer(referrerId) {
 
 // Registro de usuario
 app.post('/register', async (req, res) => {
-  const { email, name, password, referralCode } = req.body;
-  if (!email || !name || !password) {
+  // Admitimos firstName/lastName desde el cliente y los combinamos en name
+  const { email, name, password, referralCode, firstName, lastName } = req.body || {};
+  const safeEmail = (email || '').toLowerCase().trim();
+  const fullName = (name || `${firstName || ''} ${lastName || ''}`).trim();
+
+  if (!safeEmail || !fullName || !password) {
     return res.status(400).json({ error: 'Faltan datos requeridos' });
   }
   const hashedPassword = await bcrypt.hash(password, 10);
@@ -403,8 +407,8 @@ app.post('/register', async (req, res) => {
 
     const user = await prisma.user.create({
       data: { 
-        email, 
-        name, 
+        email: safeEmail, 
+        name: fullName, 
         password: hashedPassword,
         publicId: generateShortId('USR'),
         securityId,
