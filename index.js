@@ -766,7 +766,7 @@ app.get('/users/:id', authenticateToken, async (req, res) => {
 });
 
 app.put('/users/:id', authenticateToken, async (req, res) => {
-  const { name, email, phone, address, cedula, dob } = req.body;
+  const { name, email, phone, address, cedula, dob, bio, socials } = req.body;
   // Solo admin/superadmin o el propio usuario pueden editar
   if (req.user.role !== 'admin' && req.user.role !== 'superadmin' && req.user.userId !== Number(req.params.id)) {
      return res.status(403).json({ error: 'No autorizado para editar este usuario' });
@@ -774,7 +774,7 @@ app.put('/users/:id', authenticateToken, async (req, res) => {
   try {
     const user = await prisma.user.update({
       where: { id: Number(req.params.id) },
-      data: { name, email, phone, address, cedula, dob }
+      data: { name, email, phone, address, cedula, dob, bio, socials }
     });
     res.json({ message: 'Usuario actualizado', user });
   } catch (error) {
@@ -1649,7 +1649,9 @@ app.get('/users/public/:id', async (req, res) => {
         securityId: true,
         identityVerified: true,
         reputationScore: true,
-        createdAt: true
+        createdAt: true,
+        bio: true,
+        socials: true
       }
     });
 
