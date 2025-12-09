@@ -740,7 +740,8 @@ app.get('/me/raffles', authenticateToken, async (req, res) => {
           numbers: [],
           serialNumber: t.serialNumber,
           status: t.raffle.status,
-          isWinner: false 
+          isWinner: false,
+          createdAt: t.createdAt
         };
       }
       grouped[t.raffleId].numbers.push(t.number);
@@ -816,9 +817,19 @@ app.post('/tickets', authenticateToken, async (req, res) => {
           type: 'manual_payment',
           status: 'pending',
           reference: `Compra Rifa: ${raffle.title}`,
-          proof
+          proof,
+          raffleId: Number(raffleId)
         }
       });
+
+      if (user.email) {
+        sendEmail(
+          user.email,
+          'Pago en Revisión - MegaRifas',
+          `Hemos recibido tu reporte de pago para la rifa ${raffle.title}. Lo revisaremos pronto.`,
+          `<h1>Pago en Revisión</h1><p>Hemos recibido tu comprobante para la rifa <b>${raffle.title}</b>.</p><p>Nuestro equipo verificará la transacción y te notificaremos cuando tus tickets sean asignados.</p>`
+        ).catch(console.error);
+      }
 
       // Crear ticket en estado pendiente (sin número asignado aún o reservado)
       // NOTA: El usuario pidió números aleatorios 00001-10000 al verificar.
