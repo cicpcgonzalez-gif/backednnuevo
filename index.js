@@ -199,6 +199,17 @@ function generateVerificationCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
+function generateSecurityId() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let result = 'MR-';
+  for (let i = 0; i < 4; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  result += '-';
+  result += chars.charAt(Math.floor(Math.random() * chars.length));
+  return result;
+}
+
 // Reintentos para conexión a DB al iniciar
 async function waitForDatabase(retries = 5, delay = 2000) {
   for (let i = 0; i < retries; i++) {
@@ -309,7 +320,21 @@ app.get('/users', async (req, res) => {
 app.get('/raffles', async (req, res) => {
   const start = Date.now();
   try {
-    const raffles = await prisma.raffle.findMany();
+    const raffles = await prisma.raffle.findMany({
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            avatar: true,
+            securityId: true,
+            identityVerified: true,
+            reputationScore: true
+          }
+        }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
     console.log('Consulta rifas:', Date.now() - start, 'ms');
     res.json(raffles);
   } catch (error) {
@@ -368,12 +393,21 @@ app.post('/register', async (req, res) => {
       if (referrer) referredById = referrer.id;
     }
 
+    // Generate unique Security ID
+    let securityId = generateSecurityId();
+    let idExists = await prisma.user.findUnique({ where: { securityId } });
+    while (idExists) {
+      securityId = generateSecurityId();
+      idExists = await prisma.user.findUnique({ where: { securityId } });
+    }
+
     const user = await prisma.user.create({
       data: { 
         email, 
         name, 
         password: hashedPassword,
         publicId: generateShortId('USR'),
+        securityId,
         referredById,
         verificationToken,
         verified: false
@@ -1314,6 +1348,53 @@ app.post('/superadmin/users/:id/reset-2fa', authenticateToken, authorizeRole(['s
 
 app.post('/superadmin/users/:id/revoke-sessions', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
   res.json({ message: 'Sesiones revocadas' });
+});
+
+// Endpoint público para perfil de usuario
+app.get('/users/public/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: Number(id) },
+      select: {
+        id: true,
+        name: true,
+        avatar: true,
+        securityId: true,
+        identityVerified: true,
+        reputationScore: true,
+        createdAt: true
+      }
+    });
+
+    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+    // Calcular estadísticas en tiempo real
+    const rafflesCount = await prisma.raffle.count({ where: { userId: user.id } });
+    
+    // Contar tickets vendidos en todas sus rifas
+    // Primero obtenemos los IDs de sus rifas
+    const userRaffles = await prisma.raffle.findMany({ 
+      where: { userId: user.id },
+      select: { id: true }
+    });
+    const raffleIds = userRaffles.map(r => r.id);
+    
+    const salesCount = await prisma.ticket.count({
+      where: { raffleId: { in: raffleIds } }
+    });
+
+    res.json({
+      ...user,
+      stats: {
+        raffles: rafflesCount,
+        sales: salesCount
+      }
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al obtener perfil público' });
+  }
 });
 
 // --- MANUAL PAYMENTS ENDPOINTS ---

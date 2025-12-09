@@ -37,6 +37,10 @@ model User {
   reactions     Reaction[]
   wins          Winner[]
   pushToken     String?
+  securityId    String?  @unique
+  identityVerified Boolean @default(false)
+  reputationScore Float    @default(5.0)
+  raffles       Raffle[] @relation("UserRaffles")
 }
 
 model Winner {
@@ -84,6 +88,8 @@ model Raffle {
   lottery     String?
   style       Json?    // { bannerImage: "base64...", themeColor: "#hex", terms: "text", whatsapp: "...", instagram: "..." }
   createdAt   DateTime @default(now())
+  userId      Int?
+  user        User?    @relation("UserRaffles", fields: [userId], references: [id])
   tickets     Ticket[]
   winners     Winner[]
 }
