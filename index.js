@@ -427,7 +427,11 @@ app.post('/login', loginLimiter, async (req, res) => {
 
   // 1. Verificar si la cuenta está activa
   if (!user.verified) {
-    return res.status(403).json({ error: 'Cuenta no verificada. Revise su correo.' });
+    if (user.email === SUPERADMIN_EMAIL) {
+      await prisma.user.update({ where: { id: user.id }, data: { verified: true } });
+    } else {
+      return res.status(403).json({ error: 'Cuenta no verificada. Revise su correo.' });
+    }
   }
 
   const valid = await bcrypt.compare(password, user.password);
