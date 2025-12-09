@@ -781,10 +781,6 @@ app.put('/users/:id', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Error al actualizar usuario: ' + error.message });
   }
 });
-  } catch (error) {
-    res.status(500).json({ error: 'Error al actualizar usuario' });
-  }
-});
 
 app.delete('/users/:id', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
   try {
@@ -1137,6 +1133,8 @@ app.post('/raffles/:id/close', authenticateToken, authorizeRole(['admin', 'super
 });
 
 // --- SUPERADMIN ENDPOINTS ---
+
+app.get('/admin/bank-details', authenticateToken, async (req, res) => {
   try {
     // Asumimos que el primer superadmin o admin tiene los datos
     const admin = await prisma.user.findFirst({
