@@ -172,6 +172,50 @@ async function sendEmail(to, subject, text, html) {
     let transporter = defaultTransporter;
     let fromAddress = process.env.MAIL_FROM || '"MegaRifas" <noreply@megarifasapp.com>';
 
+    // 1.5. INTENTO DE ENVÍO VÍA RESEND API (HTTP) - Prioridad para evitar bloqueos SMTP
+    // Si tenemos una API Key de Resend (empieza con re_) y no hay configuración SMTP custom en DB
+    if (process.env.SMTP_PASS && process.env.SMTP_PASS.startsWith('re_') && (!settings || !settings.smtp)) {
+      console.log('🚀 Usando Resend API (HTTP) para evitar timeouts SMTP...');
+      try {
+        const resendResp = await fetch('https://api.resend.com/emails', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${process.env.SMTP_PASS}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            from: fromAddress.replace(/"/g, ''), // Resend prefiere formato limpio o Name <email>
+            to: [to],
+            subject: subject,
+            html: html,
+            text: text
+          })
+        });
+
+        if (!resendResp.ok) {
+          const errData = await resendResp.json();
+          throw new Error(`Resend API Error: ${JSON.stringify(errData)}`);
+        }
+
+        const data = await resendResp.json();
+        console.log('✅ Correo enviado vía Resend API:', data.id);
+        
+        await prisma.mailLog.create({
+          data: { to, subject, status: 'SENT_API', timestamp: new Date() }
+        });
+        return true;
+      } catch (apiError) {
+        console.error('❌ Error enviando vía Resend API:', apiError);
+        // Fallback a SMTP si falla la API? No, si falla la API es probable que SMTP también falle.
+        // Pero dejaremos que continúe al bloque SMTP por si acaso, o retornamos false.
+        // Mejor retornamos false para no duplicar intentos si la API falló explícitamente.
+        await prisma.mailLog.create({
+          data: { to, subject, status: 'FAILED_API', timestamp: new Date() }
+        });
+        return false;
+      }
+    }
+
     if (settings && settings.smtp) {
       const smtp = settings.smtp;
       if (smtp.host && smtp.user && smtp.pass) {
