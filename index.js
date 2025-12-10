@@ -111,17 +111,30 @@ prisma.$use(async (params, next) => {
 const { v4: uuidv4 } = require('uuid');
 const nodemailer = require('nodemailer');
 
-// Configuración de transporte de correo (Mock o SMTP)
-// Se inicializa vacío, se crea dinámicamente en sendEmail
+// Configuración de transporte de correo (Resend por defecto si hay pass, sino Ethereal)
 let defaultTransporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || 'smtp.ethereal.email',
-  port: Number(process.env.SMTP_PORT) || 587,
-  secure: process.env.SMTP_SECURE === 'true',
+  host: process.env.SMTP_HOST || 'smtp.resend.com',
+  port: Number(process.env.SMTP_PORT) || 465,
+  secure: process.env.SMTP_SECURE === 'true' || true, // Default to true for Resend (465)
   auth: {
-    user: process.env.SMTP_USER || 'ethereal_user',
-    pass: process.env.SMTP_PASS || 'ethereal_pass'
+    user: process.env.SMTP_USER || 'resend',
+    pass: process.env.SMTP_PASS
   }
 });
+
+// Si no hay password, usar Ethereal para dev
+if (!process.env.SMTP_PASS) {
+  console.log('⚠️ No SMTP_PASS provided. Using Ethereal email for testing.');
+  defaultTransporter = nodemailer.createTransport({
+    host: 'smtp.ethereal.email',
+    port: 587,
+    secure: false,
+    auth: {
+      user: 'ethereal_user',
+      pass: 'ethereal_pass'
+    }
+  });
+}
 
 async function sendEmail(to, subject, text, html) {
   try {
