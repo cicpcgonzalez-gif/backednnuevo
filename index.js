@@ -111,14 +111,30 @@ prisma.$use(async (params, next) => {
 const { v4: uuidv4 } = require('uuid');
 const nodemailer = require('nodemailer');
 
-// Configuración de transporte de correo (Resend por defecto si hay pass, sino Ethereal)
+// Configuración de transporte de correo (Mock o SMTP)
+let smtpHost = process.env.SMTP_HOST;
+let smtpPort = Number(process.env.SMTP_PORT);
+let smtpSecure = process.env.SMTP_SECURE === 'true';
+let smtpUser = process.env.SMTP_USER;
+let smtpPass = process.env.SMTP_PASS;
+
+// Auto-detect Resend if missing config but password looks like Resend API Key
+if (!smtpHost && smtpPass && smtpPass.startsWith('re_')) {
+  console.log('⚠️ Detectada API Key de Resend pero faltan variables de entorno. Configurando automáticamente para Resend.');
+  smtpHost = 'smtp.resend.com';
+  smtpPort = 465;
+  smtpSecure = true;
+  smtpUser = 'resend';
+}
+
+// Se inicializa vacío, se crea dinámicamente en sendEmail
 let defaultTransporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || 'smtp.resend.com',
-  port: Number(process.env.SMTP_PORT) || 465,
-  secure: process.env.SMTP_SECURE === 'true' || true, // Default to true for Resend (465)
+  host: smtpHost || 'smtp.ethereal.email',
+  port: smtpPort || 587,
+  secure: smtpSecure,
   auth: {
-    user: process.env.SMTP_USER || 'resend',
-    pass: process.env.SMTP_PASS
+    user: smtpUser || 'ethereal_user',
+    pass: smtpPass || 'ethereal_pass'
   }
 });
 
@@ -147,7 +163,7 @@ async function sendEmail(to, subject, text, html) {
     }
 
     let transporter = defaultTransporter;
-    let fromAddress = '"MegaRifas" <noreply@megarifasapp.com>';
+    let fromAddress = process.env.MAIL_FROM || '"MegaRifas" <noreply@megarifasapp.com>';
 
     if (settings && settings.smtp) {
       const smtp = settings.smtp;
@@ -163,7 +179,7 @@ async function sendEmail(to, subject, text, html) {
         });
         fromAddress = `"${smtp.fromName || 'MegaRifas'}" <${smtp.fromEmail || smtp.user}>`;
       }
-    } else if (!process.env.SMTP_HOST) {
+    } else if (!smtpHost && !smtpPass) {
       // Si no hay config en DB ni en ENV, mock
       console.log(`[MOCK EMAIL] To: ${to} | Subject: ${subject}`);
       await prisma.mailLog.create({
@@ -2409,12 +2425,12 @@ app.get('/debug/test-email', async (req, res) => {
   if (!email) return res.status(400).json({ error: 'Falta el parametro ?email=...' });
 
   const config = {
-    host: process.env.SMTP_HOST,
-    port: process.env.SMTP_PORT,
-    user: process.env.SMTP_USER,
-    secure: process.env.SMTP_SECURE,
+    host: smtpHost,
+    port: smtpPort,
+    user: smtpUser,
+    secure: smtpSecure,
     from: process.env.MAIL_FROM || 'no-reply@megarifasapp.com',
-    hasPass: !!process.env.SMTP_PASS
+    hasPass: !!smtpPass
   };
 
   try {
