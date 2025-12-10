@@ -2296,6 +2296,37 @@ app.get('/', (req, res) => {
   res.json({ message: 'API de rifas funcionando' });
 });
 
+// Endpoint de diagnóstico para Email (Temporal)
+app.get('/debug/test-email', async (req, res) => {
+  const { email } = req.query;
+  if (!email) return res.status(400).json({ error: 'Falta el parametro ?email=...' });
+
+  const config = {
+    host: process.env.SMTP_HOST,
+    port: process.env.SMTP_PORT,
+    user: process.env.SMTP_USER,
+    secure: process.env.SMTP_SECURE,
+    from: process.env.MAIL_FROM || 'no-reply@megarifasapp.com',
+    hasPass: !!process.env.SMTP_PASS
+  };
+
+  try {
+    const info = await defaultTransporter.sendMail({
+      from: config.from,
+      to: email,
+      subject: 'Prueba de Diagnóstico MegaRifas',
+      html: '<h1>Funciona!</h1><p>Si lees esto, el correo está bien configurado.</p>'
+    });
+    return res.json({ message: 'Correo enviado', info, config });
+  } catch (err) {
+    return res.status(500).json({ 
+      error: 'Fallo el envio', 
+      details: err.message, 
+      config 
+    });
+  }
+});
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Servidor backend escuchando en el puerto ${PORT} (Accesible desde red)`);
 });
