@@ -1,6 +1,3 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -11,112 +8,112 @@ datasource db {
 }
 
 model User {
-  id           Int      @id @default(autoincrement())
-  publicId     String   @unique @default(uuid())
-  email        String   @unique
-  name         String
-  password     String
-  role         String   @default("user")
-  active       Boolean  @default(true)
-  verified     Boolean  @default(false)
+  id                Int            @id @default(autoincrement())
+  publicId          String         @unique @default(uuid())
+  email             String         @unique
+  name              String
+  password          String
+  role              String         @default("user")
+  active            Boolean        @default(true)
+  verified          Boolean        @default(false)
   verificationToken String?
-  lastActivity DateTime @default(now())
-  createdAt    DateTime @default(now())
-  balance      Float    @default(0.0)
-  avatar       String?
-  bio          String?
-  socials      Json?
-  referralCode String?  @unique
-  referredById Int?
-  referredBy   User?    @relation("Referrals", fields: [referredById], references: [id])
-  referrals    User[]   @relation("Referrals")
-  bankDetails  Json?    // { bank: "Banco", account: "0102...", type: "corriente", cedula: "V-..." }
-  tickets      Ticket[]
-  transactions Transaction[]
-  announcements Announcement[]
-  reactions     Reaction[]
-  wins          Winner[]
-  pushToken     String?
-  securityId    String?  @unique
-  identityVerified Boolean @default(false)
-  reputationScore Float    @default(5.0)
-  raffles       Raffle[] @relation("UserRaffles")
+  lastActivity      DateTime       @default(now())
+  createdAt         DateTime       @default(now())
+  balance           Float          @default(0.0)
+  avatar            String?
+  bio               String?
+  socials           Json?
+  referralCode      String?        @unique
+  referredById      Int?
+  bankDetails       Json?
+  pushToken         String?
+  identityVerified  Boolean        @default(false)
+  reputationScore   Float          @default(5.0)
+  securityId        String?        @unique
+  announcements     Announcement[]
+  raffles           Raffle[]       @relation("UserRaffles")
+  reactions         Reaction[]
+  tickets           Ticket[]
+  transactions      Transaction[]
+  referredBy        User?          @relation("Referrals", fields: [referredById], references: [id])
+  referrals         User[]         @relation("Referrals")
+  wins              Winner[]
 }
 
 model Winner {
   id          Int      @id @default(autoincrement())
   raffleId    Int
-  raffle      Raffle   @relation(fields: [raffleId], references: [id])
   userId      Int?
-  user        User?    @relation(fields: [userId], references: [id])
   photoUrl    String?
   testimonial String?
   prize       String?
   drawDate    DateTime @default(now())
+  raffle      Raffle   @relation(fields: [raffleId], references: [id])
+  user        User?    @relation(fields: [userId], references: [id])
 }
 
 model Announcement {
-  id        Int      @id @default(autoincrement())
+  id        Int        @id @default(autoincrement())
   title     String
   content   String
   imageUrl  String?
-  createdAt DateTime @default(now())
+  createdAt DateTime   @default(now())
   adminId   Int
-  admin     User     @relation(fields: [adminId], references: [id])
+  admin     User       @relation(fields: [adminId], references: [id])
   reactions Reaction[]
 }
 
 model Reaction {
-  id             Int           @id @default(autoincrement())
+  id             Int          @id @default(autoincrement())
   type           String
   userId         Int
-  user           User          @relation(fields: [userId], references: [id])
   announcementId Int
-  announcement   Announcement  @relation(fields: [announcementId], references: [id])
-  createdAt      DateTime      @default(now())
+  createdAt      DateTime     @default(now())
+  announcement   Announcement @relation(fields: [announcementId], references: [id])
+  user           User         @relation(fields: [userId], references: [id])
 
   @@unique([userId, announcementId])
 }
 
 model Raffle {
-  id          Int      @id @default(autoincrement())
-  title       String
-  prize       String
-  terms       String?
-  ticketPrice Float    @default(0.0)
-  totalTickets Int     @default(10000)
-  lottery     String?
-  style       Json?    // { bannerImage: "base64...", themeColor: "#hex", terms: "text", whatsapp: "...", instagram: "..." }
-  createdAt   DateTime @default(now())
-  userId      Int?
-  user        User?    @relation("UserRaffles", fields: [userId], references: [id])
-  tickets     Ticket[]
-  winners     Winner[]
+  id           Int      @id @default(autoincrement())
+  title        String
+  prize        String
+  terms        String?
+  ticketPrice  Float    @default(0.0)
+  totalTickets Int      @default(10000)
+  lottery      String?
+  style        Json?
+  createdAt    DateTime @default(now())
+  userId       Int?
+  user         User?    @relation("UserRaffles", fields: [userId], references: [id])
+  tickets      Ticket[]
+  winners      Winner[]
 }
 
 model Transaction {
   id        Int      @id @default(autoincrement())
   amount    Float
-  type      String   // 'deposit', 'purchase', 'withdrawal', 'manual_payment'
-  status    String   // 'pending', 'approved', 'rejected'
+  type      String
+  status    String
   reference String?
-  proof     String?  // URL or Base64 of payment proof
-  raffleId  Int?     // Optional, for manual payments linked to a raffle
-  user      User     @relation(fields: [userId], references: [id])
+  proof     String?
+  raffleId  Int?
   userId    Int
   createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id])
 }
 
 model Ticket {
   id           Int      @id @default(autoincrement())
   serialNumber String   @unique @default(uuid())
   number       Int
-  user         User     @relation(fields: [userId], references: [id])
   userId       Int
-  raffle       Raffle   @relation(fields: [raffleId], references: [id])
   raffleId     Int
-  status       String   @default("approved") // 'pending', 'approved'
+  status       String   @default("approved")
   createdAt    DateTime @default(now())
+  raffle       Raffle   @relation(fields: [raffleId], references: [id])
+  user         User     @relation(fields: [userId], references: [id])
 
   @@unique([raffleId, number])
 }
@@ -125,11 +122,11 @@ model SystemSettings {
   id           Int      @id @default(1)
   branding     Json?
   modules      Json?
-  smtp         Json?    // { host, port, user, pass, secure, fromName, fromEmail }
-  company      Json?    // { name, address, rif, phone, email }
-  techSupport  Json?    // { phone, email }
-  securityCode String?  // "SEC-..."
+  smtp         Json?
   updatedAt    DateTime @updatedAt
+  company      Json?
+  securityCode String?
+  techSupport  Json?
 }
 
 model AuditLog {
