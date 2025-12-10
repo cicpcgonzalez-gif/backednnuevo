@@ -49,9 +49,9 @@ app.use((req, res, next) => {
 
 // Rate Limiter for Login
 const loginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // Limit each IP to 5 login requests per windowMs
-  message: { error: 'Demasiados intentos de inicio de sesión, por favor intente nuevamente en 15 minutos.' }
+  windowMs: 2 * 60 * 1000, // 2 minutes (Solicitud del usuario)
+  max: 4, // Limit each IP to 4 login requests per windowMs
+  message: { error: 'Demasiados intentos. Cuenta bloqueada temporalmente por 2 minutos.' }
 });
 
 // Inicializar Prisma
@@ -499,7 +499,7 @@ app.post('/resend-code', async (req, res) => {
 });
 
 // Login de usuario
-app.post('/login', loginLimiter, async (req, res) => {
+const handleLogin = async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
     return res.status(400).json({ error: 'Faltan datos requeridos' });
@@ -519,32 +519,17 @@ app.post('/login', loginLimiter, async (req, res) => {
   const valid = await bcrypt.compare(password, user.password);
   if (!valid) return res.status(401).json({ error: 'Contraseña incorrecta' });
 
-  // 2. Seguridad para Admins (2FA) - desactivada temporalmente para pruebas
-  // if (user.role === 'admin') {
-  //   const twoFactorToken = generateVerificationCode();
-  //   await prisma.user.update({
-  //     where: { id: user.id },
-  //     data: { verificationToken: twoFactorToken }
-  //   });
-
-  //   // Enviar código al admin
-  //   sendEmail(
-  //     user.email,
-  //     'Código de Seguridad (2FA)',
-  //     `Tu código de acceso es: ${twoFactorToken}`,
-  //     `<h1>Seguridad MegaRifas</h1><p>Estás intentando acceder como Administrador.</p><p>Tu código es:</p><h2 style="color: #d97706;">${twoFactorToken}</h2>`
-  //   ).catch(console.error);
-
-  //   return res.json({ require2FA: true, email: user.email, message: 'Código de seguridad enviado' });
-  // }
-
   const token = jwt.sign({ userId: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '1h' });
   
   // Remove password from user object before sending
   const { password: _, ...userWithoutPassword } = user;
   
-  res.json({ message: 'Login exitoso', token, user: userWithoutPassword });
-});
+  // Adaptar respuesta para que coincida con lo que espera la App móvil (accessToken)
+  res.json({ message: 'Login exitoso', token, accessToken: token, user: userWithoutPassword });
+};
+
+app.post('/login', loginLimiter, handleLogin);
+app.post('/auth/login', loginLimiter, handleLogin); // Alias para la App Móvil
 
 // Validar 2FA Admin
 app.post('/auth/2fa', async (req, res) => {
@@ -2294,6 +2279,115 @@ app.get('/health', (req, res) => {
 // Forzar redeploy en Render
 app.get('/', (req, res) => {
   res.json({ message: 'API de rifas funcionando' });
+});
+
+// --- GESTIÓN DE PAGOS MANUALES (Admin) ---
+
+// Listar pagos manuales pendientes
+app.get('/admin/manual-payments', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const payments = await prisma.transaction.findMany({
+      where: {
+        type: 'manual_payment',
+        status: 'pending'
+      },
+      include: {
+        user: {
+          select: { id: true, name: true, email: true } // Ajustado: 'phone' no existe en User según schema
+        }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+    res.json(payments);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al listar pagos manuales' });
+  }
+});
+
+// Aprobar pago manual y asignar tickets
+app.post('/admin/manual-payments/:id/approve', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const payment = await prisma.transaction.findUnique({ where: { id: Number(id) } });
+    if (!payment) return res.status(404).json({ error: 'Pago no encontrado' });
+    if (payment.status !== 'pending') return res.status(400).json({ error: 'El pago ya fue procesado' });
+
+    if (!payment.raffleId) return res.status(400).json({ error: 'Pago sin rifa asociada' });
+    const raffle = await prisma.raffle.findUnique({ where: { id: payment.raffleId } });
+    
+    const quantity = Math.floor(payment.amount / raffle.ticketPrice);
+    if (quantity <= 0) return res.status(400).json({ error: 'Monto insuficiente para un ticket' });
+
+    const soldTickets = await prisma.ticket.findMany({
+      where: { raffleId: raffle.id },
+      select: { number: true }
+    });
+    const soldSet = new Set(soldTickets.map(t => t.number));
+    
+    const assignedNumbers = [];
+    let attempts = 0;
+    while (assignedNumbers.length < quantity && attempts < quantity * 100) {
+      const num = Math.floor(Math.random() * raffle.totalTickets) + 1;
+      if (!soldSet.has(num) && !assignedNumbers.includes(num)) {
+        assignedNumbers.push(num);
+      }
+      attempts++;
+    }
+
+    if (assignedNumbers.length < quantity) {
+      return res.status(400).json({ error: 'No hay suficientes tickets disponibles' });
+    }
+
+    await prisma.$transaction(async (tx) => {
+      await tx.transaction.update({
+        where: { id: Number(id) },
+        data: { status: 'approved' }
+      });
+
+      for (const num of assignedNumbers) {
+        await tx.ticket.create({
+          data: {
+            number: num,
+            userId: payment.userId,
+            raffleId: raffle.id,
+            status: 'approved'
+          }
+        });
+      }
+    });
+
+    const user = await prisma.user.findUnique({ where: { id: payment.userId } });
+    if (user) {
+      sendEmail(
+        user.email,
+        'Pago Aprobado - Tickets Asignados',
+        `Tu pago ha sido aprobado. Tus números son: ${assignedNumbers.join(', ')}`,
+        `<h1>¡Pago Aprobado!</h1><p>Gracias por tu compra.</p><p>Tus números de la suerte son:</p><h3>${assignedNumbers.join(', ')}</h3>`
+      ).catch(console.error);
+    }
+
+    res.json({ message: 'Pago aprobado y tickets generados', tickets: assignedNumbers });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al aprobar pago' });
+  }
+});
+
+// Rechazar pago manual
+app.post('/admin/manual-payments/:id/reject', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  const { id } = req.params;
+  try {
+    await prisma.transaction.update({
+      where: { id: Number(id) },
+      data: { status: 'rejected' }
+    });
+    res.json({ message: 'Pago rechazado' });
+  } catch (error) {
+    res.status(500).json({ error: 'Error al rechazar pago' });
+  }
 });
 
 // Endpoint de diagnóstico para Email (Temporal)
