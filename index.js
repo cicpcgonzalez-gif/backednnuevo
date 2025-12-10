@@ -2421,9 +2421,49 @@ app.get('/debug/test-email', async (req, res) => {
   }
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Servidor backend escuchando en el puerto ${PORT} (Accesible desde red)`);
+// Start Server with DB Check and Error Handling
+async function startServer() {
+  try {
+    console.log('Iniciando servidor...');
+    console.log('Intentando conectar a la base de datos...');
+    await prisma.$connect();
+    console.log('Conexión a base de datos exitosa.');
+
+    const server = app.listen(PORT, '0.0.0.0', () => {
+      console.log(`Servidor backend escuchando en el puerto ${PORT} (Accesible desde red)`);
+    });
+
+    // Graceful shutdown
+    const shutdown = async (signal) => {
+      console.log(`${signal} recibido. Cerrando servidor...`);
+      server.close(() => {
+        console.log('Servidor HTTP cerrado.');
+      });
+      await prisma.$disconnect();
+      console.log('Conexión a BD cerrada.');
+      process.exit(0);
+    };
+
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
+
+  } catch (error) {
+    console.error('ERROR FATAL AL INICIAR EL SERVIDOR:', error);
+    process.exit(1);
+  }
+}
+
+// Manejo de errores no capturados
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+  // Mantener vivo si es posible, o salir
 });
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+startServer();
 
 // Middleware global de manejo de errores (SIEMPRE al final)
 app.use((err, req, res, next) => {
