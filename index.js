@@ -2423,44 +2423,52 @@ app.get('/debug/test-email', async (req, res) => {
 
 // Start Server with DB Check and Error Handling
 async function startServer() {
+  console.log('Iniciando proceso de arranque del servidor...');
+  
+  // 1. Iniciar servidor HTTP inmediatamente para satisfacer a Render (evitar timeout 502)
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`✅ Servidor backend escuchando en el puerto ${PORT} (Accesible desde red)`);
+    console.log(`   - Ambiente: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`   - URL Local: http://localhost:${PORT}`);
+  });
+
+  // 2. Conectar a la base de datos en segundo plano
   try {
-    console.log('Iniciando servidor...');
-    console.log('Intentando conectar a la base de datos...');
+    console.log('⏳ Intentando conectar a la base de datos...');
     await prisma.$connect();
-    console.log('Conexión a base de datos exitosa.');
+    console.log('✅ Conexión a base de datos exitosa.');
+  } catch (error) {
+    console.error('❌ ERROR CRÍTICO DE BASE DE DATOS:', error);
+    console.error('   El servidor seguirá ejecutándose para mostrar logs, pero las consultas fallarán.');
+    // No hacemos process.exit(1) para permitir ver los logs en Render
+  }
 
-    const server = app.listen(PORT, '0.0.0.0', () => {
-      console.log(`Servidor backend escuchando en el puerto ${PORT} (Accesible desde red)`);
+  // Graceful shutdown
+  const shutdown = async (signal) => {
+    console.log(`${signal} recibido. Cerrando servidor...`);
+    server.close(() => {
+      console.log('Servidor HTTP cerrado.');
     });
-
-    // Graceful shutdown
-    const shutdown = async (signal) => {
-      console.log(`${signal} recibido. Cerrando servidor...`);
-      server.close(() => {
-        console.log('Servidor HTTP cerrado.');
-      });
+    try {
       await prisma.$disconnect();
       console.log('Conexión a BD cerrada.');
-      process.exit(0);
-    };
+    } catch (e) {
+      console.error('Error al cerrar BD:', e);
+    }
+    process.exit(0);
+  };
 
-    process.on('SIGTERM', () => shutdown('SIGTERM'));
-    process.on('SIGINT', () => shutdown('SIGINT'));
-
-  } catch (error) {
-    console.error('ERROR FATAL AL INICIAR EL SERVIDOR:', error);
-    process.exit(1);
-  }
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 // Manejo de errores no capturados
 process.on('uncaughtException', (err) => {
-  console.error('Uncaught Exception:', err);
-  // Mantener vivo si es posible, o salir
+  console.error('❌ Uncaught Exception:', err);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
 startServer();
