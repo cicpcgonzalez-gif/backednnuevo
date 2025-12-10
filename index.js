@@ -65,6 +65,13 @@ const SUPERADMIN_EMAIL = 'rifa@megarifasapp.com';
 const SUPERADMIN_PASSWORD = 'rifasadmin123';
 const SUPERADMIN_ROLE = 'superadmin';
 
+const VENEZUELA_STATES = [
+  'Amazonas', 'Anzoategui', 'Apure', 'Aragua', 'Barinas', 'Bolivar', 'Carabobo', 'Cojedes',
+  'Delta Amacuro', 'Distrito Capital', 'Falcon', 'Guarico', 'Lara', 'Merida', 'Miranda',
+  'Monagas', 'Nueva Esparta', 'Portuguesa', 'Sucre', 'Tachira', 'Trujillo', 'Vargas',
+  'Yaracuy', 'Zulia'
+];
+
 // Middleware de autenticación
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
@@ -111,14 +118,30 @@ prisma.$use(async (params, next) => {
 const { v4: uuidv4 } = require('uuid');
 const nodemailer = require('nodemailer');
 
-// Configuración de transporte de correo (Resend por defecto si hay pass, sino Ethereal)
+// Configuración de transporte de correo (Mock o SMTP)
+let smtpHost = process.env.SMTP_HOST;
+let smtpPort = Number(process.env.SMTP_PORT);
+let smtpSecure = process.env.SMTP_SECURE === 'true';
+let smtpUser = process.env.SMTP_USER;
+let smtpPass = process.env.SMTP_PASS;
+
+// Auto-detect Resend if missing config but password looks like Resend API Key
+if (!smtpHost && smtpPass && smtpPass.startsWith('re_')) {
+  console.log('⚠️ Detectada API Key de Resend pero faltan variables de entorno. Configurando automáticamente para Resend.');
+  smtpHost = 'smtp.resend.com';
+  smtpPort = 465;
+  smtpSecure = true;
+  smtpUser = 'resend';
+}
+
+// Se inicializa vacío, se crea dinámicamente en sendEmail
 let defaultTransporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || 'smtp.resend.com',
-  port: Number(process.env.SMTP_PORT) || 465,
-  secure: process.env.SMTP_SECURE === 'true' || true, // Default to true for Resend (465)
+  host: smtpHost || 'smtp.ethereal.email',
+  port: smtpPort || 587,
+  secure: smtpSecure,
   auth: {
-    user: process.env.SMTP_USER || 'resend',
-    pass: process.env.SMTP_PASS
+    user: smtpUser || 'ethereal_user',
+    pass: smtpPass || 'ethereal_pass'
   }
 });
 
@@ -147,7 +170,7 @@ async function sendEmail(to, subject, text, html) {
     }
 
     let transporter = defaultTransporter;
-    let fromAddress = '"MegaRifas" <noreply@megarifasapp.com>';
+    let fromAddress = process.env.MAIL_FROM || '"MegaRifas" <noreply@megarifasapp.com>';
 
     if (settings && settings.smtp) {
       const smtp = settings.smtp;
@@ -163,7 +186,7 @@ async function sendEmail(to, subject, text, html) {
         });
         fromAddress = `"${smtp.fromName || 'MegaRifas'}" <${smtp.fromEmail || smtp.user}>`;
       }
-    } else if (!process.env.SMTP_HOST) {
+    } else if (!smtpHost && !smtpPass) {
       // Si no hay config en DB ni en ENV, mock
       console.log(`[MOCK EMAIL] To: ${to} | Subject: ${subject}`);
       await prisma.mailLog.create({
@@ -344,12 +367,13 @@ app.get('/raffles', async (req, res) => {
             identityVerified: true,
             reputationScore: true
           }
-        }
+        },
+        _count: { select: { tickets: true } }
       },
       orderBy: { createdAt: 'desc' }
     });
     console.log('Consulta rifas:', Date.now() - start, 'ms');
-    res.json(raffles);
+    res.json(raffles.map(r => ({ ...r, soldTickets: r._count?.tickets || 0 })));
   } catch (error) {
     res.status(500).json({ error: 'Error al obtener rifas' });
   }
@@ -393,12 +417,18 @@ async function checkAndRewardReferrer(referrerId) {
 // Registro de usuario
 app.post('/register', async (req, res) => {
   // Admitimos firstName/lastName desde el cliente y los combinamos en name
-  const { email, name, password, referralCode, firstName, lastName } = req.body || {};
+  const { email, name, password, referralCode, firstName, lastName, state } = req.body || {};
   const safeEmail = (email || '').toLowerCase().trim();
   const fullName = (name || `${firstName || ''} ${lastName || ''}`).trim();
+  const safeState = (state || '').trim();
 
-  if (!safeEmail || !fullName || !password) {
+  if (!safeEmail || !fullName || !password || !safeState) {
     return res.status(400).json({ error: 'Faltan datos requeridos' });
+  }
+
+  const normalizedState = VENEZUELA_STATES.find((s) => s.toLowerCase() === safeState.toLowerCase());
+  if (!normalizedState) {
+    return res.status(400).json({ error: 'Estado inválido, selecciona un estado de Venezuela' });
   }
   const hashedPassword = await bcrypt.hash(password, 10);
   const verificationToken = generateVerificationCode();
@@ -422,6 +452,7 @@ app.post('/register', async (req, res) => {
       data: { 
         email: safeEmail, 
         name: fullName, 
+        state: normalizedState,
         password: hashedPassword,
         publicId: generateShortId('USR'),
         securityId,
@@ -1055,8 +1086,8 @@ app.get('/admin/bank-details', async (req, res) => {
 
 app.get('/admin/raffles', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
   try {
-    const raffles = await prisma.raffle.findMany({ orderBy: { createdAt: 'desc' } });
-    res.json(raffles);
+    const raffles = await prisma.raffle.findMany({ orderBy: { createdAt: 'desc' }, include: { _count: { select: { tickets: true } } } });
+    res.json(raffles.map(r => ({ ...r, soldTickets: r._count?.tickets || 0 })));
   } catch (error) {
     res.status(500).json({ error: 'Error al obtener rifas' });
   }
@@ -1126,6 +1157,130 @@ app.get('/admin/tickets', authenticateToken, authorizeRole(['admin', 'superadmin
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Error al buscar tickets' });
+  }
+});
+
+// --- ADMIN METRICS ---
+app.get('/admin/metrics/summary', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+
+    const tickets = await prisma.ticket.findMany({ include: { raffle: { select: { ticketPrice: true } } } });
+    const todayTickets = tickets.filter((t) => t.createdAt >= startOfDay);
+    const ticketsSold = tickets.length;
+    const participants = new Set(tickets.map((t) => t.userId)).size;
+    const totalRevenue = tickets.reduce((acc, t) => acc + (t.raffle?.ticketPrice || 0), 0);
+    const todayRevenue = todayTickets.reduce((acc, t) => acc + (t.raffle?.ticketPrice || 0), 0);
+    const pendingPayments = await prisma.transaction.count({ where: { status: 'pending' } });
+
+    res.json({
+      ticketsSold,
+      participants,
+      pendingPayments,
+      totalRevenue,
+      todaySales: todayTickets.length,
+      todayRevenue
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al obtener métricas' });
+  }
+});
+
+app.get('/admin/metrics/hourly', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const { raffleId } = req.query;
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+
+    const where = { createdAt: { gte: startOfDay } };
+    if (raffleId) where.raffleId = Number(raffleId);
+
+    const tickets = await prisma.ticket.findMany({ where, select: { createdAt: true } });
+    const buckets = Array.from({ length: 24 }, () => 0);
+    tickets.forEach((t) => {
+      const h = new Date(t.createdAt).getHours();
+      buckets[h] += 1;
+    });
+    res.json(buckets.map((count, hour) => ({ hour, count })));
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al obtener ventas por hora' });
+  }
+});
+
+app.get('/admin/metrics/daily', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const days = Number(req.query.days) || 7;
+    const since = new Date();
+    since.setHours(0, 0, 0, 0);
+    since.setDate(since.getDate() - (days - 1));
+
+    const tickets = await prisma.ticket.findMany({
+      where: { createdAt: { gte: since } },
+      select: { createdAt: true, raffleId: true }
+    });
+
+    const map = new Map();
+    for (let i = 0; i < days; i++) {
+      const d = new Date(since);
+      d.setDate(since.getDate() + i);
+      const key = d.toISOString().slice(0, 10);
+      map.set(key, 0);
+    }
+    tickets.forEach((t) => {
+      const key = new Date(t.createdAt).toISOString().slice(0, 10);
+      if (map.has(key)) map.set(key, (map.get(key) || 0) + 1);
+    });
+
+    res.json(Array.from(map.entries()).map(([date, count]) => ({ date, count })));
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al obtener ventas diarias' });
+  }
+});
+
+app.get('/admin/metrics/by-state', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const tickets = await prisma.ticket.findMany({
+      select: {
+        user: { select: { state: true } }
+      }
+    });
+    const counts = {};
+    tickets.forEach((t) => {
+      const st = t.user?.state || 'DESCONOCIDO';
+      counts[st] = (counts[st] || 0) + 1;
+    });
+    const result = Object.entries(counts)
+      .map(([state, count]) => ({ state, count }))
+      .sort((a, b) => b.count - a.count);
+    res.json(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al obtener ventas por estado' });
+  }
+});
+
+app.get('/admin/metrics/top-buyers', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const buyers = await prisma.ticket.groupBy({
+      by: ['userId'],
+      _count: { userId: true },
+      orderBy: { _count: { userId: 'desc' } },
+      take: 10
+    });
+
+    const enriched = await Promise.all(buyers.map(async (b) => {
+      const user = await prisma.user.findUnique({ where: { id: b.userId }, select: { name: true, email: true, state: true } });
+      return { userId: b.userId, tickets: b._count.userId, name: user?.name || 'Usuario', email: user?.email, state: user?.state || 'DESCONOCIDO' };
+    }));
+
+    res.json(enriched);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al obtener top de compra' });
   }
 });
 
@@ -1722,121 +1877,7 @@ app.post('/raffles/:id/manual-payments', authenticateToken, async (req, res) => 
   }
 });
 
-// Listar pagos manuales pendientes (Admin)
-app.get('/admin/manual-payments', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
-  try {
-    const payments = await prisma.transaction.findMany({
-      where: { 
-        type: 'manual_payment',
-        status: 'pending'
-      },
-      include: { user: true },
-      orderBy: { createdAt: 'desc' }
-    });
-    
-    // Mapear para el frontend
-    const mapped = payments.map(p => ({
-      id: p.id,
-      raffleId: p.raffleId,
-      userId: p.user.email,
-      amount: p.amount,
-      reference: p.reference,
-      proof: p.proof,
-      status: p.status,
-      note: p.reference
-    }));
-
-    res.json(mapped);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Error al listar pagos manuales' });
-  }
-});
-
-// Aprobar/Rechazar pago manual
-app.post('/admin/manual-payments/:id/:action', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
-  const { id, action } = req.params; // action: 'approve' | 'reject'
-  
-  try {
-    const transaction = await prisma.transaction.findUnique({ where: { id: Number(id) } });
-    if (!transaction || transaction.status !== 'pending') {
-      return res.status(404).json({ error: 'Transacción no encontrada o ya procesada' });
-    }
-
-    if (action === 'reject') {
-      await prisma.transaction.update({
-        where: { id: Number(id) },
-        data: { status: 'rejected' }
-      });
-      return res.json({ message: 'Pago rechazado' });
-    }
-
-    if (action === 'approve') {
-      if (!transaction.raffleId) return res.status(400).json({ error: 'Transacción sin ID de rifa asociado' });
-      
-      const raffle = await prisma.raffle.findUnique({ where: { id: transaction.raffleId } });
-      if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
-
-      // Calcular cantidad de tickets basada en el monto
-      const quantity = Math.floor(transaction.amount / raffle.ticketPrice);
-      if (quantity <= 0) return res.status(400).json({ error: 'Monto insuficiente para un ticket' });
-
-      const assignedNumbers = [];
-      
-      // Generar tickets
-      await prisma.$transaction(async (prisma) => {
-        await prisma.transaction.update({
-          where: { id: transaction.id },
-          data: { status: 'approved' }
-        });
-
-        for (let i = 0; i < quantity; i++) {
-          let assignedNumber;
-          let isUnique = false;
-          let attempts = 0;
-          while (!isUnique && attempts < 20) {
-            assignedNumber = Math.floor(Math.random() * 10000) + 1;
-            const existing = await prisma.ticket.findFirst({ where: { raffleId: raffle.id, number: assignedNumber } });
-            if (!existing) isUnique = true;
-            attempts++;
-          }
-          
-          if (isUnique) {
-            const ticket = await prisma.ticket.create({
-              data: {
-                number: assignedNumber,
-                userId: transaction.userId,
-                raffleId: raffle.id,
-                serialNumber: generateShortId('TKT'),
-                status: 'approved'
-              }
-            });
-            assignedNumbers.push(ticket.number);
-          }
-        }
-      });
-
-      // Notificar
-      const user = await prisma.user.findUnique({ where: { id: transaction.userId } });
-      if (user && user.email) {
-         sendEmail(
-          user.email,
-          'Pago Aprobado - Tickets Asignados',
-          `Tu pago ha sido verificado. Tus números son: ${assignedNumbers.join(', ')}`,
-          `<h1>¡Pago Verificado!</h1><p>Tus números asignados son: <b>${assignedNumbers.join(', ')}</b></p>`
-        ).catch(console.error);
-      }
-
-      res.json({ message: 'Pago aprobado y tickets generados', numbers: assignedNumbers });
-    } else {
-      res.status(400).json({ error: 'Acción inválida' });
-    }
-
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Error al procesar pago manual' });
-  }
-});
+// Nota: endpoints de administración de pagos manuales están al final en la sección "GESTIÓN DE PAGOS MANUALES (Admin)"
 
 const cron = require('node-cron');
 const { Expo } = require('expo-server-sdk');
@@ -2296,22 +2337,43 @@ app.get('/', (req, res) => {
 
 // --- GESTIÓN DE PAGOS MANUALES (Admin) ---
 
-// Listar pagos manuales pendientes
+// Listar pagos manuales (permite filtrar y normaliza el proof para mostrar la imagen)
 app.get('/admin/manual-payments', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
   try {
+    const { raffleId, status, reference } = req.query;
+    const where = { type: 'manual_payment' };
+    if (status) where.status = status;
+    else where.status = 'pending';
+    if (raffleId) where.raffleId = Number(raffleId);
+    if (reference) where.reference = { contains: reference, mode: 'insensitive' };
+
     const payments = await prisma.transaction.findMany({
-      where: {
-        type: 'manual_payment',
-        status: 'pending'
-      },
+      where,
       include: {
-        user: {
-          select: { id: true, name: true, email: true } // Ajustado: 'phone' no existe en User según schema
-        }
+        user: { select: { id: true, name: true, email: true, state: true } }
       },
       orderBy: { createdAt: 'desc' }
     });
-    res.json(payments);
+
+    const normalizeProof = (p) => {
+      if (!p) return null;
+      if (p.startsWith('http') || p.startsWith('data:')) return p;
+      return `data:image/jpeg;base64,${p}`;
+    };
+
+    const mapped = payments.map((p) => ({
+      id: p.id,
+      raffleId: p.raffleId,
+      amount: p.amount,
+      reference: p.reference,
+      proof: normalizeProof(p.proof),
+      status: p.status,
+      note: p.reference,
+      createdAt: p.createdAt,
+      user: p.user
+    }));
+
+    res.json(mapped);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Error al listar pagos manuales' });
@@ -2409,12 +2471,12 @@ app.get('/debug/test-email', async (req, res) => {
   if (!email) return res.status(400).json({ error: 'Falta el parametro ?email=...' });
 
   const config = {
-    host: process.env.SMTP_HOST,
-    port: process.env.SMTP_PORT,
-    user: process.env.SMTP_USER,
-    secure: process.env.SMTP_SECURE,
+    host: smtpHost,
+    port: smtpPort,
+    user: smtpUser,
+    secure: smtpSecure,
     from: process.env.MAIL_FROM || 'no-reply@megarifasapp.com',
-    hasPass: !!process.env.SMTP_PASS
+    hasPass: !!smtpPass
   };
 
   try {
