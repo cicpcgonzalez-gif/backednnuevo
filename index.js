@@ -2514,28 +2514,25 @@ app.get('/debug/test-email', async (req, res) => {
   const { email } = req.query;
   if (!email) return res.status(400).json({ error: 'Falta el parametro ?email=...' });
 
-  const config = {
-    host: smtpHost,
-    port: smtpPort,
-    user: smtpUser,
-    secure: smtpSecure,
-    from: process.env.MAIL_FROM || 'no-reply@megarifasapp.com',
-    hasPass: !!smtpPass
-  };
-
   try {
-    const info = await defaultTransporter.sendMail({
-      from: config.from,
-      to: email,
-      subject: 'Prueba de Diagnóstico MegaRifas',
-      html: '<h1>Funciona!</h1><p>Si lees esto, el correo está bien configurado.</p>'
-    });
-    return res.json({ message: 'Correo enviado', info, config });
+    console.log(`[DEBUG] Probando envío a ${email}...`);
+    // Usamos sendEmail para aprovechar la lógica de Resend API
+    const success = await sendEmail(
+      email,
+      'Prueba de Diagnóstico MegaRifas',
+      'Si lees esto, el correo funciona.',
+      '<h1>¡Funciona!</h1><p>Si lees esto, el sistema de correos está operativo.</p>'
+    );
+
+    if (success) {
+      return res.json({ message: 'Correo enviado exitosamente (Revisa logs para ver si fue API o SMTP)' });
+    } else {
+      return res.status(500).json({ error: 'Fallo el envio', details: 'Revisa los logs del servidor.' });
+    }
   } catch (err) {
     return res.status(500).json({ 
-      error: 'Fallo el envio', 
-      details: err.message, 
-      config 
+      error: 'Error interno', 
+      details: err.message 
     });
   }
 });
