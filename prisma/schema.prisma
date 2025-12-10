@@ -12,6 +12,7 @@ model User {
   publicId          String         @unique @default(uuid())
   email             String         @unique
   name              String
+  state             String         @default("DESCONOCIDO")
   password          String
   role              String         @default("user")
   active            Boolean        @default(true)
