@@ -1,7 +1,108 @@
 require('dotenv').config();
 const express = require('express');
 const { PrismaClient, Prisma } = require('@prisma/client');
-// Nota: los endpoints de administración de pagos manuales están al final de este archivo (sección GESTIÓN DE PAGOS MANUALES)
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const helmet = require('helmet');
+const cors = require('cors');
+const rateLimit = require('express-rate-limit');
+const compression = require('compression');
+
+const app = express();
+
+// Security Middleware
+app.use(helmet());
+app.use(cors());
+app.use(compression());
+
+// Simple request logger (method, path, duration)
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    console.log(`[REQ] ${req.method} ${req.originalUrl} ${res.statusCode} ${duration}ms`);
+  });
+  next();
+});
+
+// Global rate limit (applies to all routes)
+const globalLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 min
+  max: 100, // 100 requests/min/IP
+  standardHeaders: true,
+  legacyHeaders: false
+});
+app.use(globalLimiter);
+
+// Default pagination guard for GET requests
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 100;
+app.use((req, res, next) => {
+  if (req.method === 'GET') {
+    const limit = Number(req.query.limit);
+    const offset = Number(req.query.offset);
+    req.query.limit = Number.isFinite(limit) && limit > 0 ? Math.min(limit, MAX_LIMIT) : DEFAULT_LIMIT;
+    req.query.offset = Number.isFinite(offset) && offset >= 0 ? offset : 0;
+  }
+  next();
+});
+
+// Rate Limiter for Login
+const loginLimiter = rateLimit({
+  windowMs: 2 * 60 * 1000, // 2 minutes (Solicitud del usuario)
+  max: 4, // Limit each IP to 4 login requests per windowMs
+  message: { error: 'Demasiados intentos. Cuenta bloqueada temporalmente por 2 minutos.' }
+});
+
+// Inicializar Prisma
+const prisma = new PrismaClient();
+
+app.use(express.json());
+
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
+
+const SUPERADMIN_EMAIL = 'rifa@megarifasapp.com';
+const SUPERADMIN_PASSWORD = 'rifasadmin123';
+const SUPERADMIN_ROLE = 'superadmin';
+
+const VENEZUELA_STATES = [
+  'Amazonas', 'Anzoategui', 'Apure', 'Aragua', 'Barinas', 'Bolivar', 'Carabobo', 'Cojedes',
+  'Delta Amacuro', 'Distrito Capital', 'Falcon', 'Guarico', 'Lara', 'Merida', 'Miranda',
+  'Monagas', 'Nueva Esparta', 'Portuguesa', 'Sucre', 'Tachira', 'Trujillo', 'Vargas',
+  'Yaracuy', 'Zulia'
+];
+
+// Middleware de autenticación
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Token requerido' });
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) return res.status(403).json({ error: 'Token inválido' });
+    req.user = user;
+    next();
+  });
+}
+
+// Middleware de autorización por rol
+function authorizeRole(roles) {
+  return (req, res, next) => {
+    if (!req.user || !roles.includes(req.user.role)) {
+      return res.status(403).json({ error: 'Acceso denegado: Rol insuficiente' });
+    }
+    next();
+  };
+}
+
+// Prisma middleware para medir tiempos de consulta y loguear consultas lentas
+prisma.$use(async (params, next) => {
+  const start = Date.now();
+  try {
+    const result = await next(params);
+    const duration = Date.now() - start;
+    const model = params.model || 'raw';
+    const action = params.action || 'query';
     if (duration > 200) {
       console.warn(`[PRISMA SLOW] ${model}.${action} took ${duration}ms`, { params });
     } else {
