@@ -2370,9 +2370,52 @@ app.post('/admin/winners', authenticateToken, authorizeRole(['admin', 'superadmi
         photoUrl,
         testimonial,
         prize,
-        status: 'delivered' // Assuming if admin registers it manually, it's done. Or 'pending' if prize delivery is tracked.
+        status: 'delivered'
       }
     });
+
+    // --- NOTIFICATION SYSTEM ---
+    // 1. Get Raffle Details
+    const raffle = await prisma.raffle.findUnique({ where: { id: Number(raffleId) } });
+
+    // 2. Get Participants (Unique Users who bought tickets)
+    const participants = await prisma.ticket.findMany({
+      where: { raffleId: Number(raffleId) },
+      distinct: ['userId'],
+      select: { 
+        user: { select: { pushToken: true, email: true, name: true } } 
+      }
+    });
+
+    // 3. Prepare Notification Content
+    let winnerName = 'Por anunciar';
+    if (userId) {
+      const winnerUser = await prisma.user.findUnique({ where: { id: Number(userId) } });
+      if (winnerUser && winnerUser.name) winnerName = decrypt(winnerUser.name);
+    }
+
+    const title = `¡Resultados: ${raffle.title}!`;
+    const body = `El ganador es: ${winnerName}. ¡Entra para ver los detalles!`;
+
+    // 4. Send Push Notifications
+    const tokens = participants.map(p => p.user.pushToken).filter(Boolean);
+    if (tokens.length > 0) {
+      // Send in background
+      sendPushNotification(tokens, title, body, { type: 'raffle_result', raffleId: Number(raffleId) }).catch(console.error);
+    }
+
+    // 5. Audit Log (Proof of Publication Time)
+    await prisma.auditLog.create({
+      data: {
+        action: 'RESULT_PUBLISHED',
+        entity: 'Raffle',
+        userEmail: req.user.email,
+        detail: `Results published for raffle ${raffleId}. Winner: ${winnerName}. Notified ${tokens.length} participants at ${new Date().toISOString()}.`,
+        timestamp: new Date()
+      }
+    });
+    // ---------------------------
+
     res.json(winner);
   } catch (error) {
     console.error(error);
