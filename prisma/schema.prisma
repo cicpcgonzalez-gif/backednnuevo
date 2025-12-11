@@ -12,6 +12,9 @@ model User {
   publicId          String         @unique @default(uuid())
   email             String         @unique
   name              String
+  phone             String?
+  address           String?
+  cedula            String?
   state             String         @default("DESCONOCIDO")
   password          String
   role              String         @default("user")
