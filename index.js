@@ -51,6 +51,8 @@ function decrypt(text) {
 
 const app = express();
 
+console.log('🔒 Security Module Loaded: Encryption Enabled');
+
 // Security Middleware
 app.use(helmet());
 app.use(cors());
