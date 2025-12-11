@@ -7,6 +7,7 @@ const helmet = require('helmet');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const compression = require('compression');
+const crypto = require('crypto');
 
 const app = express();
 
@@ -750,7 +751,7 @@ app.post('/raffles/:id/purchase', authenticateToken, async (req, res) => {
     }
 
     while (newNumbers.length < qty && attempts < maxTickets * 3) {
-      const num = Math.floor(Math.random() * maxTickets) + 1;
+      const num = crypto.randomInt(1, maxTickets + 1);
       if (!occupiedNumbers.has(num) && !newNumbers.includes(num)) {
         newNumbers.push(num);
       }
@@ -930,7 +931,7 @@ app.post('/tickets', authenticateToken, async (req, res) => {
     const maxRange = raffle.totalTickets || 10000;
     
     while (!isUnique && attempts < 10) {
-      assignedNumber = Math.floor(Math.random() * maxRange) + 1;
+      assignedNumber = crypto.randomInt(1, maxRange + 1);
       const existing = await prisma.ticket.findFirst({
         where: { raffleId: raffle.id, number: assignedNumber }
       });
@@ -1041,7 +1042,7 @@ app.post('/admin/verify-payment/:transactionId', authenticateToken, authorizeRol
     
     while (!ticket && attempts < maxAttempts) {
       attempts++;
-      const assignedNumber = Math.floor(Math.random() * maxRange) + 1;
+      const assignedNumber = crypto.randomInt(1, maxRange + 1);
       
       try {
         ticket = await prisma.$transaction(async (tx) => {
