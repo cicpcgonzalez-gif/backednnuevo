@@ -1068,15 +1068,33 @@ app.post('/tickets', authenticateToken, async (req, res) => {
         });
       }
 
+      const serialNumber = generateShortId('TKT');
+      
+      // Generate Cryptographic Receipt Signature
+      // HMAC-SHA256 of (serialNumber + userId + raffleId + number + timestamp + SECRET)
+      const signaturePayload = `${serialNumber}|${userId}|${raffleId}|${assignedNumber}|${Date.now()}`;
+      const receiptSignature = crypto.createHmac('sha256', process.env.JWT_SECRET || 'secret').update(signaturePayload).digest('hex');
+
       const ticket = await prisma.ticket.create({
         data: { 
           number: assignedNumber, 
           userId: Number(userId), 
           raffleId: Number(raffleId),
-          serialNumber: generateShortId('TKT'),
-          status: 'approved'
+          serialNumber: serialNumber,
+          status: 'approved',
+          receiptSignature: receiptSignature
         },
         include: { user: true, raffle: true }
+      });
+
+      // Audit Log for Immutable Record
+      await prisma.auditLog.create({
+        data: {
+          action: 'TICKET_PURCHASE',
+          entity: 'Ticket',
+          userEmail: user.email,
+          detail: `Ticket #${assignedNumber} generated. Serial: ${serialNumber}. Signature: ${receiptSignature}`
+        }
       });
       
       return ticket;
@@ -1167,16 +1185,33 @@ app.post('/admin/verify-payment/:transactionId', authenticateToken, authorizeRol
             data: { status: 'approved', reference: encrypt(`Ticket #${assignedNumber} - ${raffle.title}`) }
           });
 
-          return await tx.ticket.create({
+          const serialNumber = generateShortId('TKT');
+          const signaturePayload = `${serialNumber}|${transaction.userId}|${raffle.id}|${assignedNumber}|${Date.now()}`;
+          const receiptSignature = crypto.createHmac('sha256', process.env.JWT_SECRET || 'secret').update(signaturePayload).digest('hex');
+
+          const newTicket = await tx.ticket.create({
             data: {
               number: assignedNumber,
               userId: transaction.userId,
               raffleId: raffle.id,
-              serialNumber: generateShortId('TKT'),
-              status: 'approved'
+              serialNumber: serialNumber,
+              status: 'approved',
+              receiptSignature: receiptSignature
             },
             include: { user: true, raffle: true }
           });
+
+          // Audit Log
+          await tx.auditLog.create({
+            data: {
+              action: 'MANUAL_PAYMENT_APPROVED',
+              entity: 'Ticket',
+              userEmail: transaction.user.email,
+              detail: `Ticket #${assignedNumber} generated via manual payment. Serial: ${serialNumber}. Signature: ${receiptSignature}`
+            }
+          });
+
+          return newTicket;
         });
       } catch (err) {
         // Si el error es por duplicado (P2002) o nuestro 'Number taken', continuamos el loop
@@ -1206,6 +1241,40 @@ app.post('/admin/verify-payment/:transactionId', authenticateToken, authorizeRol
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Error al verificar pago' });
+  }
+});
+
+// --- VERIFICATION ---
+app.get('/verify-ticket/:serial', async (req, res) => {
+  const { serial } = req.params;
+  try {
+    const ticket = await prisma.ticket.findUnique({
+      where: { serialNumber: serial },
+      include: { 
+        user: { select: { name: true, publicId: true } },
+        raffle: { select: { title: true } }
+      }
+    });
+
+    if (!ticket) return res.status(404).json({ valid: false, error: 'Ticket no encontrado' });
+
+    // Decrypt user name for display
+    if (ticket.user && ticket.user.name) ticket.user.name = decrypt(ticket.user.name);
+
+    res.json({
+      valid: true,
+      ticket: {
+        serialNumber: ticket.serialNumber,
+        number: ticket.number,
+        raffle: ticket.raffle.title,
+        holder: ticket.user.name,
+        signature: ticket.receiptSignature,
+        verifiedAt: new Date()
+      }
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error de verificación' });
   }
 });
 

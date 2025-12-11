@@ -136,6 +136,7 @@ model Ticket {
   raffleId     Int
   status       String   @default("approved")
   createdAt    DateTime @default(now())
+  receiptSignature String? // Cryptographic signature of the ticket details
   raffle       Raffle   @relation(fields: [raffleId], references: [id])
   user         User     @relation(fields: [userId], references: [id])
 
