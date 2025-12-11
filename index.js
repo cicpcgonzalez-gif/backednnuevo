@@ -2492,6 +2492,39 @@ app.get('/me/tickets', authenticateToken, async (req, res) => {
   }
 });
 
+app.get('/me/wins', authenticateToken, async (req, res) => {
+  try {
+    const wins = await prisma.winner.findMany({
+      where: { userId: req.user.userId },
+      include: { raffle: true },
+      orderBy: { drawDate: 'desc' }
+    });
+    res.json(wins);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al obtener premios' });
+  }
+});
+
+app.get('/me/audit-logs', authenticateToken, async (req, res) => {
+  try {
+    // Fetch audit logs related to this user's email
+    // Note: AuditLog uses userEmail, so we need to ensure we have the email.
+    const user = await prisma.user.findUnique({ where: { id: req.user.userId }, select: { email: true } });
+    if (!user || !user.email) return res.json([]);
+
+    const logs = await prisma.auditLog.findMany({
+      where: { userEmail: user.email },
+      orderBy: { timestamp: 'desc' },
+      take: 50
+    });
+    res.json(logs);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al obtener registros de auditoría' });
+  }
+});
+
 app.get('/me/payments', authenticateToken, async (req, res) => {
   try {
     const payments = await prisma.transaction.findMany({
