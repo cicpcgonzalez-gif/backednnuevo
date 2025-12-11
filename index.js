@@ -9,6 +9,7 @@ const rateLimit = require('express-rate-limit');
 const compression = require('compression');
 const crypto = require('crypto');
 const FraudEngine = require('./utils/fraudEngine');
+const paymentService = require('./services/paymentService');
 
 // Encryption Configuration
 // Ensure ENCRYPTION_KEY is 32 bytes. Using JWT_SECRET to derive one if not provided.
@@ -518,16 +519,31 @@ async function checkAndRewardReferrer(referrerId) {
   }
 }
 
+const amlService = require('./services/amlService');
+
 // Registro de usuario
 app.post('/register', async (req, res) => {
   // Admitimos firstName/lastName desde el cliente y los combinamos en name
-  const { email, name, password, referralCode, firstName, lastName, state } = req.body || {};
+  const { email, name, password, referralCode, firstName, lastName, state, cedula } = req.body || {};
   const safeEmail = (email || '').toLowerCase().trim();
   const fullName = (name || `${firstName || ''} ${lastName || ''}`).trim();
   const safeState = (state || '').trim();
 
   if (!safeEmail || !fullName || !password || !safeState) {
     return res.status(400).json({ error: 'Faltan datos requeridos' });
+  }
+
+  // AML Check
+  const amlCheck = await amlService.checkPerson(fullName, cedula);
+  if (amlCheck.isBlacklisted) {
+    await securityLogger.log({
+      action: 'REGISTER_BLOCKED_AML',
+      userEmail: safeEmail,
+      ipAddress: req.ip,
+      severity: 'CRITICAL',
+      detail: `Blocked registration for blacklisted person: ${fullName}. Reason: ${amlCheck.reason}`
+    });
+    return res.status(403).json({ error: 'No podemos procesar su registro en este momento. Contacte a soporte.' });
   }
 
   const normalizedState = VENEZUELA_STATES.find((s) => s.toLowerCase() === safeState.toLowerCase());
@@ -668,14 +684,42 @@ const handleLogin = async (req, res) => {
   if (!valid) {
     // Log failed login attempt
     await FraudEngine.logActivity(user.id, 'LOGIN_FAIL', 'Invalid password', 'LOW', req.ip);
+    await securityLogger.log({
+      action: 'LOGIN_FAILED',
+      userEmail: email,
+      userId: user.id,
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+      severity: 'WARN',
+      detail: 'Invalid password attempt'
+    });
     return res.status(401).json({ error: 'Contraseña incorrecta' });
   }
 
   // Check if user is flagged
   if (user.isFlagged) {
     await FraudEngine.logActivity(user.id, 'LOGIN_FLAGGED', 'Flagged user logged in', 'MEDIUM', req.ip);
-    // Optional: Block login if risk is too high? For now just log.
+    await securityLogger.log({
+      action: 'LOGIN_FLAGGED_USER',
+      userEmail: email,
+      userId: user.id,
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+      severity: 'WARN',
+      detail: 'Flagged user logged in'
+    });
   }
+
+  // Log successful login
+  await securityLogger.log({
+    action: 'LOGIN_SUCCESS',
+    userEmail: email,
+    userId: user.id,
+    ipAddress: req.ip,
+    userAgent: req.headers['user-agent'],
+    severity: 'INFO',
+    detail: 'User logged in successfully'
+  });
 
   const token = jwt.sign({ userId: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '1h' });
   
@@ -702,6 +746,15 @@ app.post('/auth/2fa', async (req, res) => {
   if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
 
   if (user.verificationToken !== code) {
+    await securityLogger.log({
+      action: '2FA_FAILED',
+      userEmail: email,
+      userId: user.id,
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+      severity: 'WARN',
+      detail: 'Invalid 2FA code'
+    });
     return res.status(400).json({ error: 'Código inválido' });
   }
 
@@ -709,6 +762,16 @@ app.post('/auth/2fa', async (req, res) => {
   await prisma.user.update({
     where: { id: user.id },
     data: { verificationToken: null }
+  });
+
+  await securityLogger.log({
+    action: '2FA_SUCCESS',
+    userEmail: email,
+    userId: user.id,
+    ipAddress: req.ip,
+    userAgent: req.headers['user-agent'],
+    severity: 'INFO',
+    detail: '2FA verification successful'
   });
 
   const token = jwt.sign({ userId: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '1h' });
@@ -952,6 +1015,19 @@ app.put('/users/:id', authenticateToken, async (req, res) => {
       where: { id: Number(req.params.id) },
       data: dataToUpdate
     });
+
+    await securityLogger.log({
+      action: 'USER_UPDATE',
+      userEmail: req.user.email,
+      userId: req.user.userId,
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+      severity: 'INFO',
+      detail: `User ${req.params.id} updated profile`,
+      entity: 'User',
+      entityId: req.params.id
+    });
+
     res.json({ message: 'Usuario actualizado', user });
   } catch (error) {
     console.error('Error updating user:', error);
@@ -969,6 +1045,41 @@ app.delete('/users/:id', authenticateToken, authorizeRole(['admin', 'superadmin'
 });
 
 // CRUD para tickets
+const securityLogger = require('./services/securityLogger');
+
+// --- Payment Routes ---
+
+// Initiate a payment
+app.post('/payments/initiate', authenticateToken, async (req, res) => {
+  const { amount, currency, provider, type, raffleId } = req.body;
+  const userId = req.user.userId;
+
+  try {
+    const result = await paymentService.initiateTransaction(userId, parseFloat(amount), currency, provider, type, raffleId);
+    res.json(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error initiating payment' });
+  }
+});
+
+// Webhook for payment providers
+app.post('/payments/webhook/:provider', async (req, res) => {
+  const { provider } = req.params;
+  const data = req.body;
+
+  try {
+    // Verify signature here in a real app (e.g. Stripe signature)
+    await paymentService.handleWebhook(provider, data);
+    res.json({ received: true });
+  } catch (error) {
+    console.error(error);
+    res.status(400).json({ error: 'Webhook handling failed' });
+  }
+});
+
+// --- End Payment Routes ---
+
 app.post('/tickets', authenticateToken, async (req, res) => {
   const { userId, raffleId, paymentMethod, proof } = req.body;
   if (!userId || !raffleId) {
@@ -1132,7 +1243,12 @@ app.post('/admin/verify-payment/:transactionId', authenticateToken, authorizeRol
     if (action === 'reject') {
       await prisma.transaction.update({
         where: { id: transaction.id },
-        data: { status: 'rejected', reference: encrypt(reason ? `Rechazado: ${reason}` : 'Rechazado por admin') }
+        data: { 
+          status: 'rejected', 
+          reference: encrypt(reason ? `Rechazado: ${reason}` : 'Rechazado por admin'),
+          reconciled: true,
+          reconciledAt: new Date()
+        }
       });
       
       if (transaction.user.email) {
@@ -1182,7 +1298,12 @@ app.post('/admin/verify-payment/:transactionId', authenticateToken, authorizeRol
           
           await tx.transaction.update({
             where: { id: transaction.id },
-            data: { status: 'approved', reference: encrypt(`Ticket #${assignedNumber} - ${raffle.title}`) }
+            data: { 
+              status: 'approved', 
+              reference: encrypt(`Ticket #${assignedNumber} - ${raffle.title}`),
+              reconciled: true,
+              reconciledAt: new Date()
+            }
           });
 
           const serialNumber = generateShortId('TKT');

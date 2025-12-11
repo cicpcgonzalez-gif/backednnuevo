@@ -48,25 +48,26 @@ const FraudEngine = {
    * @param {number} raffleId 
    */
   async checkPurchaseVelocity(userId, raffleId) {
-    const TIME_WINDOW_MINUTES = 10;
-    const TICKET_THRESHOLD = 50; // Max tickets in 10 mins without flag
+    const TIME_WINDOW_SECONDS = 10; // Ventana de 10 segundos
+    const MAX_REQUESTS = 2; // Máximo 2 compras en esa ventana
 
-    const tenMinutesAgo = new Date(Date.now() - TIME_WINDOW_MINUTES * 60 * 1000);
+    const timeWindow = new Date(Date.now() - TIME_WINDOW_SECONDS * 1000);
     
+    // Contamos transacciones recientes (intentos de compra), no solo tickets
+    // Usamos SuspiciousActivity o Transaction si existiera un log previo, 
+    // pero lo mejor es contar Tickets creados recientemente.
     const recentTickets = await prisma.ticket.count({
       where: {
         userId,
         raffleId,
-        createdAt: { gte: tenMinutesAgo }
+        createdAt: { gte: timeWindow }
       }
     });
 
-    if (recentTickets > TICKET_THRESHOLD) {
-      return {
-        isSuspicious: true,
-        reason: `High velocity purchase: ${recentTickets} tickets in ${TIME_WINDOW_MINUTES} mins`,
-        severity: 'HIGH'
-      };
+    if (recentTickets >= MAX_REQUESTS) {
+      const reason = `High velocity purchase: ${recentTickets} requests in ${TIME_WINDOW_SECONDS}s`;
+      await this.logActivity(userId, 'HIGH_VELOCITY_PURCHASE', reason, 'HIGH');
+      throw new Error('Transacción bloqueada por velocidad sospechosa. Intente más tarde.');
     }
 
     return { isSuspicious: false };

@@ -1,0 +1,45 @@
+{
+  "metadata": {
+    "timestamp": "2025-12-11T20:14:26.458Z",
+    "version": "1.0"
+  },
+  "users": [
+    {
+      "id": 1,
+      "publicId": "ADM-NCG2JZAU",
+      "email": "rifa@megarifasapp.com",
+      "name": "Super Admin",
+      "phone": null,
+      "address": null,
+      "cedula": null,
+      "state": "DESCONOCIDO",
+      "password": "$2b$10$EM682wTvNvB2en.6nzCbnesGG.AON8biVjoJRuZBCDJuXc/YgjvuS",
+      "role": "superadmin",
+      "active": true,
+      "verified": false,
+      "verificationToken": null,
+      "lastActivity": "2025-12-11T19:51:28.808Z",
+      "createdAt": "2025-12-11T19:51:28.808Z",
+      "balance": 0,
+      "avatar": null,
+      "bio": null,
+      "socials": null,
+      "referralCode": null,
+      "referredById": null,
+      "bankDetails": null,
+      "pushToken": null,
+      "identityVerified": false,
+      "reputationScore": 5,
+      "riskScore": 0,
+      "isFlagged": false,
+      "securityId": null
+    }
+  ],
+  "raffles": [],
+  "tickets": [],
+  "transactions": [],
+  "winners": [],
+  "auditLogs": [],
+  "suspiciousActivity": [],
+  "blacklist": []
+}
