@@ -2081,6 +2081,146 @@ cron.schedule('0 13 * * *', async () => {
   timezone: "America/Caracas"
 });
 
+// --- KYC ROUTES ---
+
+app.post('/kyc/submit', authenticateToken, async (req, res) => {
+  const { documentType, frontImage, backImage, selfieImage } = req.body;
+  
+  if (!frontImage || !selfieImage) {
+    return res.status(400).json({ error: 'Imágenes requeridas (Frontal y Selfie)' });
+  }
+
+  try {
+    // Check if already verified or pending
+    const existing = await prisma.kYCRequest.findFirst({
+      where: { 
+        userId: req.user.userId,
+        status: { in: ['pending', 'approved'] }
+      }
+    });
+
+    if (existing) {
+      if (existing.status === 'approved') return res.status(400).json({ error: 'Ya estás verificado' });
+      return res.status(400).json({ error: 'Ya tienes una solicitud pendiente' });
+    }
+
+    const kyc = await prisma.kYCRequest.create({
+      data: {
+        userId: req.user.userId,
+        documentType: documentType || 'cedula',
+        frontImage: encrypt(frontImage),
+        backImage: backImage ? encrypt(backImage) : null,
+        selfieImage: encrypt(selfieImage),
+        status: 'pending'
+      }
+    });
+
+    res.status(201).json({ message: 'Solicitud KYC enviada', id: kyc.id });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al enviar solicitud KYC' });
+  }
+});
+
+app.get('/kyc/status', authenticateToken, async (req, res) => {
+  try {
+    const kyc = await prisma.kYCRequest.findFirst({
+      where: { userId: req.user.userId },
+      orderBy: { createdAt: 'desc' }
+    });
+    
+    if (!kyc) return res.json({ status: 'none', identityVerified: false });
+
+    res.json({ 
+      status: kyc.status, 
+      rejectionReason: kyc.rejectionReason,
+      createdAt: kyc.createdAt 
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Error al consultar estado KYC' });
+  }
+});
+
+app.get('/admin/kyc/pending', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const requests = await prisma.kYCRequest.findMany({
+      where: { status: 'pending' },
+      include: { user: { select: { id: true, name: true, email: true, cedula: true } } },
+      orderBy: { createdAt: 'asc' }
+    });
+
+    const decrypted = requests.map(r => ({
+      ...r,
+      frontImage: decrypt(r.frontImage),
+      backImage: r.backImage ? decrypt(r.backImage) : null,
+      selfieImage: decrypt(r.selfieImage),
+      user: {
+        ...r.user,
+        name: r.user.name ? decrypt(r.user.name) : 'Usuario',
+        cedula: r.user.cedula ? decrypt(r.user.cedula) : null
+      }
+    }));
+
+    res.json(decrypted);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al listar solicitudes KYC' });
+  }
+});
+
+app.post('/admin/kyc/:id/review', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  const { status, reason } = req.body; // status: 'approved' | 'rejected'
+  
+  if (!['approved', 'rejected'].includes(status)) {
+    return res.status(400).json({ error: 'Estado inválido' });
+  }
+
+  try {
+    const kyc = await prisma.kYCRequest.findUnique({ where: { id: Number(req.params.id) } });
+    if (!kyc) return res.status(404).json({ error: 'Solicitud no encontrada' });
+
+    await prisma.$transaction(async (tx) => {
+      await tx.kYCRequest.update({
+        where: { id: kyc.id },
+        data: { 
+          status, 
+          rejectionReason: reason,
+          reviewedBy: req.user.userId
+        }
+      });
+
+      if (status === 'approved') {
+        await tx.user.update({
+          where: { id: kyc.userId },
+          data: { identityVerified: true }
+        });
+      } else {
+        // If rejected, ensure user is not verified
+        await tx.user.update({
+          where: { id: kyc.userId },
+          data: { identityVerified: false }
+        });
+      }
+    });
+
+    // Notify user
+    const user = await prisma.user.findUnique({ where: { id: kyc.userId } });
+    if (user && user.email) {
+      const subject = status === 'approved' ? 'Identidad Verificada' : 'Verificación de Identidad Rechazada';
+      const msg = status === 'approved' 
+        ? 'Tu identidad ha sido verificada exitosamente.' 
+        : `Tu solicitud de verificación ha sido rechazada. Motivo: ${reason}`;
+      
+      sendEmail(user.email, subject, msg, `<h1>${subject}</h1><p>${msg}</p>`).catch(console.error);
+    }
+
+    res.json({ message: `Solicitud ${status}` });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al procesar solicitud' });
+  }
+});
+
 // Cron Job: 4:00 PM Notification
 cron.schedule('0 16 * * *', async () => {
   console.log('[CRON] Sending 4 PM notification...');
@@ -2141,13 +2281,27 @@ app.get('/winners', async (req, res) => {
 app.post('/admin/winners', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
   try {
     const { raffleId, userId, photoUrl, testimonial, prize } = req.body;
+    
+    // Enforce KYC for winners
+    if (userId) {
+      const user = await prisma.user.findUnique({ where: { id: Number(userId) } });
+      if (!user) return res.status(404).json({ error: 'Usuario ganador no encontrado' });
+      
+      if (!user.identityVerified) {
+        return res.status(400).json({ 
+          error: 'El usuario ganador NO ha verificado su identidad (KYC). No se puede registrar como ganador hasta cumplir con la normativa Anti-Lavado de Dinero.' 
+        });
+      }
+    }
+
     const winner = await prisma.winner.create({
       data: {
         raffleId: Number(raffleId),
         userId: userId ? Number(userId) : null,
         photoUrl,
         testimonial,
-        prize
+        prize,
+        status: 'delivered' // Assuming if admin registers it manually, it's done. Or 'pending' if prize delivery is tracked.
       }
     });
     res.json(winner);
