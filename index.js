@@ -8,6 +8,7 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const compression = require('compression');
 const crypto = require('crypto');
+const FraudEngine = require('./utils/fraudEngine');
 
 // Encryption Configuration
 // Ensure ENCRYPTION_KEY is 32 bytes. Using JWT_SECRET to derive one if not provided.
@@ -664,7 +665,17 @@ const handleLogin = async (req, res) => {
   }
 
   const valid = await bcrypt.compare(password, user.password);
-  if (!valid) return res.status(401).json({ error: 'Contraseña incorrecta' });
+  if (!valid) {
+    // Log failed login attempt
+    await FraudEngine.logActivity(user.id, 'LOGIN_FAIL', 'Invalid password', 'LOW', req.ip);
+    return res.status(401).json({ error: 'Contraseña incorrecta' });
+  }
+
+  // Check if user is flagged
+  if (user.isFlagged) {
+    await FraudEngine.logActivity(user.id, 'LOGIN_FLAGGED', 'Flagged user logged in', 'MEDIUM', req.ip);
+    // Optional: Block login if risk is too high? For now just log.
+  }
 
   const token = jwt.sign({ userId: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '1h' });
   
@@ -1010,6 +1021,16 @@ app.post('/tickets', authenticateToken, async (req, res) => {
     if (user.balance < raffle.ticketPrice) {
       return res.status(400).json({ error: 'Saldo insuficiente' });
     }
+
+    // --- FRAUD CHECK ---
+    const velocityCheck = await FraudEngine.checkPurchaseVelocity(user.id, raffle.id);
+    if (velocityCheck.isSuspicious) {
+      await FraudEngine.logActivity(user.id, 'PURCHASE_VELOCITY', velocityCheck.reason, velocityCheck.severity, req.ip);
+      if (velocityCheck.severity === 'HIGH' || velocityCheck.severity === 'CRITICAL') {
+        return res.status(403).json({ error: 'Actividad inusual detectada. Por favor contacte a soporte.' });
+      }
+    }
+    // -------------------
 
     // Generar número aleatorio único
     let assignedNumber;
