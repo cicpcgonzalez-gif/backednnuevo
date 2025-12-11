@@ -872,7 +872,7 @@ app.delete('/users/:id', authenticateToken, authorizeRole(['admin', 'superadmin'
 
 // CRUD para tickets
 app.post('/tickets', authenticateToken, async (req, res) => {
-  const { number, userId, raffleId, paymentMethod, proof } = req.body;
+  const { userId, raffleId, paymentMethod, proof } = req.body;
   if (!userId || !raffleId) {
     return res.status(400).json({ error: 'Faltan datos requeridos' });
   }
