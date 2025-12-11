@@ -9,6 +9,46 @@ const rateLimit = require('express-rate-limit');
 const compression = require('compression');
 const crypto = require('crypto');
 
+// Encryption Configuration
+// Ensure ENCRYPTION_KEY is 32 bytes. Using JWT_SECRET to derive one if not provided.
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY 
+  ? Buffer.from(process.env.ENCRYPTION_KEY, 'hex') 
+  : crypto.createHash('sha256').update(String(process.env.JWT_SECRET || 'dev-secret')).digest();
+
+const IV_LENGTH = 16;
+
+function encrypt(text) {
+  if (!text) return text;
+  if (typeof text !== 'string') text = String(text);
+  try {
+    const iv = crypto.randomBytes(IV_LENGTH);
+    const cipher = crypto.createCipheriv('aes-256-cbc', ENCRYPTION_KEY, iv);
+    let encrypted = cipher.update(text);
+    encrypted = Buffer.concat([encrypted, cipher.final()]);
+    return iv.toString('hex') + ':' + encrypted.toString('hex');
+  } catch (e) {
+    console.error('Encryption error:', e);
+    return text;
+  }
+}
+
+function decrypt(text) {
+  if (!text) return text;
+  try {
+    const textParts = text.split(':');
+    if (textParts.length !== 2) return text; // Not encrypted or different format
+    const iv = Buffer.from(textParts[0], 'hex');
+    const encryptedText = Buffer.from(textParts[1], 'hex');
+    const decipher = crypto.createDecipheriv('aes-256-cbc', ENCRYPTION_KEY, iv);
+    let decrypted = decipher.update(encryptedText);
+    decrypted = Buffer.concat([decrypted, decipher.final()]);
+    return decrypted.toString();
+  } catch (e) {
+    // console.error('Decryption error:', e);
+    return text; // Return original if decryption fails
+  }
+}
+
 const app = express();
 
 // Security Middleware
@@ -390,8 +430,18 @@ app.get('/users', async (req, res) => {
   const start = Date.now();
   try {
     const users = await prisma.user.findMany();
+    const decryptedUsers = users.map(u => {
+      if (u.name) u.name = decrypt(u.name);
+      if (u.phone) u.phone = decrypt(u.phone);
+      if (u.address) u.address = decrypt(u.address);
+      if (u.cedula) u.cedula = decrypt(u.cedula);
+      if (u.bankDetails && typeof u.bankDetails === 'string') {
+         try { u.bankDetails = JSON.parse(decrypt(u.bankDetails)); } catch(e){}
+      }
+      return u;
+    });
     console.log('Consulta usuarios:', Date.now() - start, 'ms');
-    res.json(users);
+    res.json(decryptedUsers);
   } catch (error) {
     res.status(500).json({ error: 'Error al obtener usuarios' });
   }
@@ -418,7 +468,13 @@ app.get('/raffles', async (req, res) => {
       orderBy: { createdAt: 'desc' }
     });
     console.log('Consulta rifas:', Date.now() - start, 'ms');
-    res.json(raffles.map(r => ({ ...r, soldTickets: r._count?.tickets || 0 })));
+    
+    const decryptedRaffles = raffles.map(r => {
+      if (r.user && r.user.name) r.user.name = decrypt(r.user.name);
+      return { ...r, soldTickets: r._count?.tickets || 0 };
+    });
+
+    res.json(decryptedRaffles);
   } catch (error) {
     res.status(500).json({ error: 'Error al obtener rifas' });
   }
@@ -442,7 +498,7 @@ async function checkAndRewardReferrer(referrerId) {
             amount: rewardAmount,
             type: 'bonus',
             status: 'approved',
-            reference: `Recompensa por ${count} referidos`
+            reference: encrypt(`Recompensa por ${count} referidos`)
           }
         })
       ]);
@@ -496,7 +552,7 @@ app.post('/register', async (req, res) => {
     const user = await prisma.user.create({
       data: { 
         email: safeEmail, 
-        name: fullName, 
+        name: encrypt(fullName), 
         state: normalizedState,
         password: hashedPassword,
         publicId: generateShortId('USR'),
@@ -613,6 +669,10 @@ const handleLogin = async (req, res) => {
   // Remove password from user object before sending
   const { password: _, ...userWithoutPassword } = user;
   
+  // Decrypt sensitive data
+  if (userWithoutPassword.name) userWithoutPassword.name = decrypt(userWithoutPassword.name);
+  if (userWithoutPassword.bankDetails) userWithoutPassword.bankDetails = JSON.parse(decrypt(JSON.stringify(userWithoutPassword.bankDetails)));
+
   // Adaptar respuesta para que coincida con lo que espera la App móvil (accessToken)
   res.json({ message: 'Login exitoso', token, accessToken: token, user: userWithoutPassword });
 };
@@ -640,6 +700,10 @@ app.post('/auth/2fa', async (req, res) => {
 
   const token = jwt.sign({ userId: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '1h' });
   const { password: _, ...userWithoutPassword } = user;
+
+  // Decrypt sensitive data
+  if (userWithoutPassword.name) userWithoutPassword.name = decrypt(userWithoutPassword.name);
+  if (userWithoutPassword.bankDetails) userWithoutPassword.bankDetails = JSON.parse(decrypt(JSON.stringify(userWithoutPassword.bankDetails)));
 
   res.json({ message: 'Login exitoso', token, user: userWithoutPassword });
 });
@@ -837,6 +901,20 @@ app.get('/users/:id', authenticateToken, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({ where: { id: Number(req.params.id) } });
     if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+    
+    // Decrypt sensitive data
+    if (user.name) user.name = decrypt(user.name);
+    if (user.phone) user.phone = decrypt(user.phone);
+    if (user.address) user.address = decrypt(user.address);
+    if (user.cedula) user.cedula = decrypt(user.cedula);
+    if (user.bankDetails && typeof user.bankDetails === 'string') {
+       try {
+         user.bankDetails = JSON.parse(decrypt(user.bankDetails));
+       } catch (e) {
+         // If it wasn't encrypted or failed to parse, keep as is
+       }
+    }
+
     res.json(user);
   } catch (error) {
     res.status(500).json({ error: 'Error al consultar usuario' });
@@ -844,15 +922,22 @@ app.get('/users/:id', authenticateToken, async (req, res) => {
 });
 
 app.put('/users/:id', authenticateToken, async (req, res) => {
-  const { name, email, phone, address, cedula, dob, bio, socials } = req.body;
+  const { name, email, phone, address, cedula, dob, bio, socials, bankDetails } = req.body;
   // Solo admin/superadmin o el propio usuario pueden editar
   if (req.user.role !== 'admin' && req.user.role !== 'superadmin' && req.user.userId !== Number(req.params.id)) {
      return res.status(403).json({ error: 'No autorizado para editar este usuario' });
   }
   try {
+    const dataToUpdate = { email, dob, bio, socials };
+    if (name) dataToUpdate.name = encrypt(name);
+    if (phone) dataToUpdate.phone = encrypt(phone);
+    if (address) dataToUpdate.address = encrypt(address);
+    if (cedula) dataToUpdate.cedula = encrypt(cedula);
+    if (bankDetails) dataToUpdate.bankDetails = encrypt(JSON.stringify(bankDetails));
+
     const user = await prisma.user.update({
       where: { id: Number(req.params.id) },
-      data: { name, email, phone, address, cedula, dob, bio, socials }
+      data: dataToUpdate
     });
     res.json({ message: 'Usuario actualizado', user });
   } catch (error) {
@@ -894,8 +979,8 @@ app.post('/tickets', authenticateToken, async (req, res) => {
           amount: -raffle.ticketPrice,
           type: 'manual_payment',
           status: 'pending',
-          reference: `Compra Rifa: ${raffle.title}`,
-          proof,
+          reference: encrypt(`Compra Rifa: ${raffle.title}`),
+          proof: encrypt(proof),
           raffleId: Number(raffleId)
         }
       });
@@ -955,7 +1040,7 @@ app.post('/tickets', authenticateToken, async (req, res) => {
             amount: -raffle.ticketPrice,
             type: 'purchase',
             status: 'approved',
-            reference: `Ticket #${assignedNumber} - ${raffle.title}`
+            reference: encrypt(`Ticket #${assignedNumber} - ${raffle.title}`)
           }
         });
       }
@@ -1006,7 +1091,7 @@ app.post('/admin/verify-payment/:transactionId', authenticateToken, authorizeRol
     if (action === 'reject') {
       await prisma.transaction.update({
         where: { id: transaction.id },
-        data: { status: 'rejected', reference: reason ? `Rechazado: ${reason}` : 'Rechazado por admin' }
+        data: { status: 'rejected', reference: encrypt(reason ? `Rechazado: ${reason}` : 'Rechazado por admin') }
       });
       
       if (transaction.user.email) {
@@ -1056,7 +1141,7 @@ app.post('/admin/verify-payment/:transactionId', authenticateToken, authorizeRol
           
           await tx.transaction.update({
             where: { id: transaction.id },
-            data: { status: 'approved', reference: `Ticket #${assignedNumber} - ${raffle.title}` }
+            data: { status: 'approved', reference: encrypt(`Ticket #${assignedNumber} - ${raffle.title}`) }
           });
 
           return await tx.ticket.create({
@@ -1319,7 +1404,13 @@ app.get('/admin/metrics/top-buyers', authenticateToken, authorizeRole(['admin', 
 
     const enriched = await Promise.all(buyers.map(async (b) => {
       const user = await prisma.user.findUnique({ where: { id: b.userId }, select: { name: true, email: true, state: true } });
-      return { userId: b.userId, tickets: b._count.userId, name: user?.name || 'Usuario', email: user?.email, state: user?.state || 'DESCONOCIDO' };
+      return { 
+        userId: b.userId, 
+        tickets: b._count.userId, 
+        name: user?.name ? decrypt(user.name) : 'Usuario', 
+        email: user?.email, 
+        state: user?.state || 'DESCONOCIDO' 
+      };
     }));
 
     res.json(enriched);
@@ -1633,7 +1724,7 @@ app.post('/wallet/topup', authenticateToken, async (req, res) => {
           amount: Number(amount),
           type: 'deposit',
           status: 'approved',
-          reference: 'Recarga de saldo'
+          reference: encrypt('Recarga de saldo')
         }
       })
     ]);
@@ -1859,6 +1950,8 @@ app.get('/users/public/:id', async (req, res) => {
 
     if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
 
+    if (user.name) user.name = decrypt(user.name);
+
     // Calcular estadísticas en tiempo real
     const rafflesCount = await prisma.raffle.count({ where: { userId: user.id } });
     
@@ -1909,8 +2002,8 @@ app.post('/raffles/:id/manual-payments', authenticateToken, async (req, res) => 
         amount,
         type: 'manual_payment',
         status: 'pending',
-        reference: reference || `Pago manual para rifa ${id}`,
-        proof,
+        reference: encrypt(reference || `Pago manual para rifa ${id}`),
+        proof: encrypt(proof),
         raffleId: raffle.id
       }
     });
@@ -2085,6 +2178,10 @@ app.get('/me', authenticateToken, async (req, res) => {
       }
     });
     if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+    // Decrypt sensitive data
+    if (user.name) user.name = decrypt(user.name);
+
     res.json(user);
   } catch (error) {
     console.error(error);
@@ -2155,7 +2252,15 @@ app.get('/me/payments', authenticateToken, async (req, res) => {
       where: { userId: req.user.userId },
       orderBy: { createdAt: 'desc' }
     });
-    res.json(payments);
+    
+    // Decrypt sensitive data
+    const decryptedPayments = payments.map(p => ({
+      ...p,
+      reference: decrypt(p.reference),
+      proof: decrypt(p.proof)
+    }));
+
+    res.json(decryptedPayments);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Error al obtener pagos' });
@@ -2261,6 +2366,8 @@ app.get('/users/public/:id', async (req, res) => {
       stats = { raffles: rafflesCount, prizes: winnersCount };
     }
 
+    if (user.name) user.name = decrypt(user.name);
+
     res.json({ ...user, stats });
   } catch (error) {
     console.error(error);
@@ -2283,7 +2390,13 @@ app.get('/announcements', async (req, res) => {
         }
       }
     });
-    res.json(announcements);
+
+    const decryptedAnnouncements = announcements.map(a => {
+      if (a.admin && a.admin.name) a.admin.name = decrypt(a.admin.name);
+      return a;
+    });
+
+    res.json(decryptedAnnouncements);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Error al obtener anuncios' });
@@ -2406,17 +2519,23 @@ app.get('/admin/manual-payments', authenticateToken, authorizeRole(['admin', 'su
       return `data:image/jpeg;base64,${p}`;
     };
 
-    const mapped = payments.map((p) => ({
-      id: p.id,
-      raffleId: p.raffleId,
-      amount: p.amount,
-      reference: p.reference,
-      proof: normalizeProof(p.proof),
-      status: p.status,
-      note: p.reference,
-      createdAt: p.createdAt,
-      user: p.user
-    }));
+    const mapped = payments.map((p) => {
+      const decryptedReference = decrypt(p.reference);
+      const decryptedProof = decrypt(p.proof);
+      const decryptedUserName = p.user ? decrypt(p.user.name) : null;
+
+      return {
+        id: p.id,
+        raffleId: p.raffleId,
+        amount: p.amount,
+        reference: decryptedReference,
+        proof: normalizeProof(decryptedProof),
+        status: p.status,
+        note: decryptedReference,
+        createdAt: p.createdAt,
+        user: p.user ? { ...p.user, name: decryptedUserName } : null
+      };
+    });
 
     res.json(mapped);
   } catch (error) {
