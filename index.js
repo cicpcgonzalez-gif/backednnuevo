@@ -3113,7 +3113,116 @@ async function startServer() {
   console.log('Iniciando proceso de arranque del servidor...');
   
   // 1. Iniciar servidor HTTP inmediatamente para satisfacer a Render (evitar timeout 502)
-  const server = app.listen(PORT, '0.0.0.0', () => {
+  const server = 
+app.post('/raffles/:id/declare-winner', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  const { id } = req.params;
+  const { winningNumber, proof } = req.body;
+
+  if (winningNumber === undefined || winningNumber === null) {
+    return res.status(400).json({ error: 'Número ganador requerido' });
+  }
+
+  try {
+    const raffle = await prisma.raffle.findUnique({ where: { id: Number(id) } });
+    if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
+
+    // Find the ticket with the winning number
+    const ticket = await prisma.ticket.findFirst({
+      where: {
+        raffleId: Number(id),
+        number: Number(winningNumber),
+        status: 'approved'
+      },
+      include: { user: true }
+    });
+
+    // Update Raffle style to mark as completed and store winning number
+    const newStyle = {
+      ...(raffle.style || {}),
+      status: 'completed',
+      winningNumber: Number(winningNumber),
+      proofUrl: proof
+    };
+
+    await prisma.raffle.update({
+      where: { id: Number(id) },
+      data: { style: newStyle }
+    });
+
+    if (ticket) {
+      // Create Winner record
+      await prisma.winner.create({
+        data: {
+          raffleId: Number(id),
+          userId: ticket.userId,
+          prize: raffle.prize,
+          status: 'pending',
+          photoUrl: proof // Initially use proof as photo, or null
+        }
+      });
+      
+      // Optional: Send notification to user (Logic to be added)
+      
+      return res.json({ message: 'Ganador declarado exitosamente', winner: ticket.user, ticket });
+    } else {
+      // No winner found (Vacante)
+      // We still mark the raffle as completed, but maybe create a "Vacante" winner record or just leave it
+      return res.json({ message: 'Rifa cerrada. No se encontró ticket con ese número (Vacante).', vacante: true });
+    }
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al declarar ganador' });
+  }
+});
+
+
+
+app.get('/me/pending-wins', authenticateToken, async (req, res) => {
+  try {
+    // Find winners for this user that haven't been "seen" or acknowledged
+    // We'll assume 'pending' status means not yet delivered/acknowledged fully
+    // Or we can add a specific flag. For now, let's return the latest pending win.
+    const win = await prisma.winner.findFirst({
+      where: {
+        userId: req.user.userId,
+        status: 'pending' // You might want to change this logic if you have other statuses
+      },
+      include: {
+        raffle: {
+          select: { title: true, prize: true }
+        }
+      },
+      orderBy: { id: 'desc' }
+    });
+
+    res.json({ win });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al verificar premios' });
+  }
+});
+
+app.post('/me/ack-win/:id', authenticateToken, async (req, res) => {
+    try {
+        // Mark as 'acknowledged' or similar so it doesn't show confetti every time
+        // For now, we might just leave it as pending until admin delivers, 
+        // but the frontend needs to know not to show it again locally.
+        // Or we can update status to 'notified'.
+        
+        // Let's update status to 'notified' if it was pending
+        await prisma.winner.updateMany({
+            where: { id: Number(req.params.id), userId: req.user.userId, status: 'pending' },
+            data: { status: 'notified' }
+        });
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: 'Error' });
+    }
+});
+
+
+app.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ Servidor backend escuchando en el puerto ${PORT} (Accesible desde red)`);
     console.log(`   - Ambiente: ${process.env.NODE_ENV || 'development'}`);
     console.log(`   - URL Local: http://localhost:${PORT}`);
