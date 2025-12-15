@@ -1,0 +1,40 @@
+{
+  "name": "rifas-backend-nuevo",
+  "version": "1.0.1",
+  "description": "",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "migrate": "prisma migrate deploy",
+    "seed:superadmin": "node create_superadmin.js",
+    "postinstall": "prisma generate",
+    "android": "expo run:android",
+    "ios": "expo run:ios"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@prisma/client": "^4.15.0",
+    "bcryptjs": "^3.0.3",
+    "compression": "^1.8.1",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "expo-server-sdk": "^4.0.0",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.2.1",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.3",
+    "node-cron": "^4.2.1",
+    "nodemailer": "^7.0.11",
+    "prisma": "^4.15.0",
+    "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.2"
+  }
+}

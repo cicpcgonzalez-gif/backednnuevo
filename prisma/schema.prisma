@@ -1,0 +1,207 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                Int            @id @default(autoincrement())
+  publicId          String         @unique @default(uuid())
+  email             String         @unique
+  name              String
+  phone             String?
+  address           String?
+  cedula            String?
+  state             String         @default("DESCONOCIDO")
+  password          String
+  role              String         @default("user")
+  active            Boolean        @default(true)
+  verified          Boolean        @default(false)
+  verificationToken String?
+  lastActivity      DateTime       @default(now())
+  createdAt         DateTime       @default(now())
+  balance           Float          @default(0.0)
+  avatar            String?
+  bio               String?
+  socials           Json?
+  referralCode      String?        @unique
+  referredById      Int?
+  bankDetails       Json?
+  pushToken         String?
+  identityVerified  Boolean        @default(false)
+  reputationScore   Float          @default(5.0)
+  riskScore         Float          @default(0.0)
+  isFlagged         Boolean        @default(false)
+  securityId        String?        @unique
+  announcements     Announcement[]
+  raffles           Raffle[]       @relation("UserRaffles")
+  reactions         Reaction[]
+  tickets           Ticket[]
+  transactions      Transaction[]
+  suspiciousActivity SuspiciousActivity[]
+  kycRequests       KYCRequest[]
+  referredBy        User?          @relation("Referrals", fields: [referredById], references: [id])
+  referrals         User[]         @relation("Referrals")
+  wins              Winner[]
+}
+
+model Winner {
+  id          Int      @id @default(autoincrement())
+  raffleId    Int
+  userId      Int?
+  photoUrl    String?
+  testimonial String?
+  prize       String?
+  status      String   @default("pending") // pending, delivered, kyc_required
+  drawDate    DateTime @default(now())
+  raffle      Raffle   @relation(fields: [raffleId], references: [id])
+  user        User?    @relation(fields: [userId], references: [id])
+}
+
+model KYCRequest {
+  id              Int      @id @default(autoincrement())
+  userId          Int
+  status          String   @default("pending") // pending, approved, rejected
+  documentType    String   @default("cedula")
+  frontImage      String   // Encrypted
+  backImage       String?  // Encrypted
+  selfieImage     String   // Encrypted
+  rejectionReason String?
+  reviewedBy      Int?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  user            User     @relation(fields: [userId], references: [id])
+}
+
+model Announcement {
+  id        Int        @id @default(autoincrement())
+  title     String
+  content   String
+  imageUrl  String?
+  createdAt DateTime   @default(now())
+  adminId   Int
+  admin     User       @relation(fields: [adminId], references: [id])
+  reactions Reaction[]
+}
+
+model Reaction {
+  id             Int          @id @default(autoincrement())
+  type           String
+  userId         Int
+  announcementId Int
+  createdAt      DateTime     @default(now())
+  announcement   Announcement @relation(fields: [announcementId], references: [id])
+  user           User         @relation(fields: [userId], references: [id])
+
+  @@unique([userId, announcementId])
+}
+
+model Raffle {
+  id           Int      @id @default(autoincrement())
+  title        String
+  prize        String
+  terms        String?
+  ticketPrice  Float    @default(0.0)
+  totalTickets Int      @default(10000)
+  lottery      String?
+  style        Json?
+  createdAt    DateTime @default(now())
+  userId       Int?
+  user         User?    @relation("UserRaffles", fields: [userId], references: [id])
+  tickets      Ticket[]
+  winners      Winner[]
+}
+
+model Transaction {
+  id          Int      @id @default(autoincrement())
+  amount      Float
+  currency    String   @default("VES") // VES, USD
+  type        String   // purchase, deposit, withdrawal, refund
+  status      String   // pending, approved, rejected, failed, refunded
+  provider    String   @default("manual") // manual, binance, stripe
+  externalId  String?  // ID from external provider
+  reference   String?  // Encrypted
+  proof       String?  // Encrypted
+  raffleId    Int?
+  userId      Int
+  reconciled  Boolean  @default(false)
+  reconciledAt DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  user        User     @relation(fields: [userId], references: [id])
+}
+
+model Ticket {
+  id           Int      @id @default(autoincrement())
+  serialNumber String   @unique @default(uuid())
+  number       Int
+  userId       Int
+  raffleId     Int
+  status       String   @default("approved")
+  createdAt    DateTime @default(now())
+  receiptSignature String? // Cryptographic signature of the ticket details
+  raffle       Raffle   @relation(fields: [raffleId], references: [id])
+  user         User     @relation(fields: [userId], references: [id])
+
+  @@unique([raffleId, number])
+}
+
+model SystemSettings {
+  id           Int      @id @default(1)
+  branding     Json?
+  modules      Json?
+  smtp         Json?
+  updatedAt    DateTime @updatedAt
+  company      Json?
+  securityCode String?
+  techSupport  Json?
+}
+
+model AuditLog {
+  id        Int      @id @default(autoincrement())
+  action    String
+  userEmail String?
+  userId    Int?
+  entity    String?
+  entityId  String?
+  detail    String?
+  ipAddress String?
+  userAgent String?
+  severity  String   @default("INFO") // INFO, WARN, ERROR, CRITICAL
+  metadata  Json?
+  timestamp DateTime @default(now())
+}
+
+model MailLog {
+  id        Int      @id @default(autoincrement())
+  to        String
+  subject   String
+  status    String
+  error     String?
+  timestamp DateTime @default(now())
+}
+
+model SuspiciousActivity {
+  id        Int      @id @default(autoincrement())
+  userId    Int?
+  ipAddress String?
+  action    String
+  reason    String
+  severity  String   @default("MEDIUM") // LOW, MEDIUM, HIGH, CRITICAL
+  metadata  Json?
+  createdAt DateTime @default(now())
+  user      User?    @relation(fields: [userId], references: [id])
+}
+
+model Blacklist {
+  id             Int      @id @default(autoincrement())
+  name           String?  // Nombre completo para búsqueda difusa
+  documentNumber String?  @unique // Cédula, Pasaporte, RIF
+  reason         String
+  source         String   // OFAC, UN, INTERNAL, POLICE
+  riskLevel      String   @default("HIGH") // HIGH, CRITICAL
+  createdAt      DateTime @default(now())
+}
