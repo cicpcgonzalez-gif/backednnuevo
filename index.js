@@ -1113,7 +1113,7 @@ app.post('/tickets', authenticateToken, async (req, res) => {
         sendEmail(
           user.email,
           'Pago en Revisión - MegaRifas',
-          `Hemos recibido tu reporte de pago para la rifa ${raffle.title}. Lo revisaremos pronto.`,
+          `Hemos recibido tu reporte de pago para la rifa ${raffle.title}. Lo revisaremos y te notificaremos.`,
           `<h1>Pago en Revisión</h1><p>Hemos recibido tu comprobante para la rifa <b>${raffle.title}</b>.</p><p>Nuestro equipo verificará la transacción y te notificaremos cuando tus tickets sean asignados.</p>`
         ).catch(console.error);
       }
@@ -1399,6 +1399,53 @@ app.get('/verify-ticket/:serial', async (req, res) => {
   }
 });
 
+// Verificador (Admin) con datos del comprador
+app.get('/admin/verify-ticket/:serial', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  const { serial } = req.params;
+  const safeSerial = String(serial || '').trim();
+  if (!safeSerial) return res.status(400).json({ valid: false, error: 'Serial requerido' });
+
+  try {
+    const ticket = await prisma.ticket.findUnique({
+      where: { serialNumber: safeSerial },
+      include: {
+        user: { select: { id: true, publicId: true, name: true, email: true, phone: true, cedula: true } },
+        raffle: { select: { id: true, title: true } }
+      }
+    });
+
+    if (!ticket) return res.status(404).json({ valid: false, error: 'Ticket no encontrado' });
+
+    const buyer = ticket.user || {};
+    const buyerSafe = {
+      id: buyer.id,
+      publicId: buyer.publicId,
+      email: buyer.email,
+      name: buyer.name ? decrypt(buyer.name) : null,
+      phone: buyer.phone ? decrypt(buyer.phone) : null,
+      cedula: buyer.cedula ? decrypt(buyer.cedula) : null
+    };
+
+    res.json({
+      valid: true,
+      ticket: {
+        id: ticket.id,
+        serialNumber: ticket.serialNumber,
+        number: ticket.number,
+        status: ticket.status,
+        createdAt: ticket.createdAt,
+        raffle: ticket.raffle,
+        buyer: buyerSafe,
+        signature: ticket.receiptSignature,
+        verifiedAt: new Date()
+      }
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error de verificación' });
+  }
+});
+
 // Endpoint para guardar datos bancarios del admin
 app.put('/admin/bank-details', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
   const { bankDetails } = req.body;
@@ -1480,7 +1527,7 @@ app.patch('/admin/raffles/:id', authenticateToken, authorizeRole(['admin', 'supe
 
 app.get('/admin/tickets', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
   try {
-    const { raffleId, status, from, to } = req.query;
+    const { raffleId, status, from, to, email, phone, cedula } = req.query;
     const where = {};
     if (raffleId) where.raffleId = Number(raffleId);
     if (status) where.status = status;
@@ -1492,11 +1539,45 @@ app.get('/admin/tickets', authenticateToken, authorizeRole(['admin', 'superadmin
 
     const tickets = await prisma.ticket.findMany({
       where,
-      include: { user: { select: { email: true, name: true } } },
+      include: {
+        user: { select: { email: true, name: true, phone: true, cedula: true } },
+        raffle: { select: { title: true } }
+      },
       orderBy: { createdAt: 'desc' },
       take: 1000
     });
-    res.json(tickets);
+
+    let normalized = (Array.isArray(tickets) ? tickets : []).map((t) => {
+      const u = t.user || {};
+      const user = {
+        ...u,
+        name: u.name ? decrypt(u.name) : u.name,
+        phone: u.phone ? decrypt(u.phone) : u.phone,
+        cedula: u.cedula ? decrypt(u.cedula) : u.cedula
+      };
+      return {
+        ...t,
+        user,
+        raffleTitle: t.raffle?.title
+      };
+    });
+
+    // Filtros por datos del comprador (teléfono/cédula están encriptados en DB)
+    const emailQ = String(email || '').trim().toLowerCase();
+    const phoneQ = String(phone || '').trim();
+    const cedulaQ = String(cedula || '').trim();
+
+    if (emailQ) {
+      normalized = normalized.filter((t) => String(t.user?.email || '').toLowerCase().includes(emailQ));
+    }
+    if (phoneQ) {
+      normalized = normalized.filter((t) => String(t.user?.phone || '').includes(phoneQ));
+    }
+    if (cedulaQ) {
+      normalized = normalized.filter((t) => String(t.user?.cedula || '').includes(cedulaQ));
+    }
+
+    res.json(normalized);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Error al buscar tickets' });
@@ -2834,9 +2915,29 @@ app.get('/announcements', async (req, res) => {
       }
     });
 
+    const ids = announcements.map((a) => a.id);
+    const grouped = ids.length
+      ? await prisma.reaction.groupBy({
+          by: ['announcementId', 'type'],
+          where: { announcementId: { in: ids } },
+          _count: { _all: true }
+        })
+      : [];
+
+    const countsMap = new Map();
+    for (const g of grouped) {
+      const annId = g.announcementId;
+      if (!countsMap.has(annId)) countsMap.set(annId, { LIKE: 0, HEART: 0, DISLIKE: 0 });
+      const entry = countsMap.get(annId);
+      entry[g.type] = g._count?._all || 0;
+    }
+
     const decryptedAnnouncements = announcements.map(a => {
       if (a.admin && a.admin.name) a.admin.name = decrypt(a.admin.name);
-      return a;
+      return {
+        ...a,
+        reactionCounts: countsMap.get(a.id) || { LIKE: 0, HEART: 0, DISLIKE: 0 }
+      };
     });
 
     res.json(decryptedAnnouncements);
