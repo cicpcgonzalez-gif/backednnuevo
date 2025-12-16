@@ -11,6 +11,72 @@ const crypto = require('crypto');
 const FraudEngine = require('./utils/fraudEngine');
 const paymentService = require('./services/paymentService');
 
+// --- Admin Plans (subscription/quotas) ---
+
+const DEFAULT_PLAN_CONFIG = {
+  unlimitedWeeklyRaffleLimit: 3,
+  starterRaffleCredits: 5,
+  proRaffleCredits: 10,
+  starterGalleryLimit: 3,
+  proGalleryLimit: 6,
+  unlimitedGalleryLimit: 10,
+  starterBoostCredits: 0,
+  proBoostCredits: 2,
+  unlimitedBoostCredits: 8
+};
+
+let cachedPlanConfig = { value: DEFAULT_PLAN_CONFIG, loadedAt: 0 };
+async function getPlanConfig() {
+  const now = Date.now();
+  if (now - cachedPlanConfig.loadedAt < 60_000) return cachedPlanConfig.value;
+  try {
+    const settings = await prisma.systemSettings.findFirst();
+    const company = settings?.company && typeof settings.company === 'object' ? settings.company : {};
+    const planConfig = company?.planConfig && typeof company.planConfig === 'object' ? company.planConfig : {};
+    const merged = { ...DEFAULT_PLAN_CONFIG, ...planConfig };
+    cachedPlanConfig = { value: merged, loadedAt: now };
+    return merged;
+  } catch (_e) {
+    return DEFAULT_PLAN_CONFIG;
+  }
+}
+
+function normalizeAdminPlan(plan, planConfig = DEFAULT_PLAN_CONFIG) {
+  if (!plan || typeof plan !== 'object') return null;
+  const tier = String(plan.tier || '').toLowerCase();
+  if (!['starter', 'pro', 'unlimited'].includes(tier)) return null;
+
+  const normalized = { ...plan, tier };
+  if (tier === 'starter') {
+    if (typeof normalized.raffleCreditsRemaining !== 'number') normalized.raffleCreditsRemaining = planConfig.starterRaffleCredits;
+    if (typeof normalized.boostCreditsRemaining !== 'number') normalized.boostCreditsRemaining = planConfig.starterBoostCredits;
+  }
+  if (tier === 'pro') {
+    if (typeof normalized.raffleCreditsRemaining !== 'number') normalized.raffleCreditsRemaining = planConfig.proRaffleCredits;
+    if (typeof normalized.boostCreditsRemaining !== 'number') normalized.boostCreditsRemaining = planConfig.proBoostCredits;
+  }
+  if (tier === 'unlimited') {
+    // unlimited no usa raffleCreditsRemaining
+    if (typeof normalized.boostCreditsRemaining !== 'number') normalized.boostCreditsRemaining = planConfig.unlimitedBoostCredits;
+  }
+  return normalized;
+}
+
+async function ensureDbColumns() {
+  try {
+    await prisma.$executeRawUnsafe('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "adminPlan" JSONB;');
+
+    await prisma.$executeRawUnsafe('ALTER TABLE "Raffle" ADD COLUMN IF NOT EXISTS "status" TEXT NOT NULL DEFAULT \'active\';');
+    await prisma.$executeRawUnsafe('ALTER TABLE "Raffle" ADD COLUMN IF NOT EXISTS "activatedAt" TIMESTAMP;');
+    await prisma.$executeRawUnsafe('ALTER TABLE "Raffle" ADD COLUMN IF NOT EXISTS "closedAt" TIMESTAMP;');
+
+    await prisma.$executeRawUnsafe('UPDATE "Raffle" SET "status"=\'active\' WHERE "status" IS NULL;');
+    await prisma.$executeRawUnsafe('UPDATE "Raffle" SET "activatedAt"="createdAt" WHERE "activatedAt" IS NULL AND "status"=\'active\';');
+  } catch (e) {
+    console.error('[DB] ensureDbColumns adminPlan failed:', e?.message || e);
+  }
+}
+
 // Encryption Configuration
 // Ensure ENCRYPTION_KEY is 32 bytes. Using JWT_SECRET to derive one if not provided.
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY 
@@ -417,6 +483,7 @@ process.on('uncaughtException', (err) => {
 
 // Ejecutar verificación de superadmin al iniciar
 ensureSuperAdmin().catch(err => console.error('ensureSuperAdmin error:', err));
+ensureDbColumns().catch(err => console.error('ensureDbColumns error:', err));
 
 // Endpoint de salud
 app.get('/health', async (req, res) => {
@@ -456,6 +523,7 @@ app.get('/raffles', async (req, res) => {
   const start = Date.now();
   try {
     const raffles = await prisma.raffle.findMany({
+      where: { status: 'active' },
       include: {
         user: {
           select: {
@@ -476,6 +544,34 @@ app.get('/raffles', async (req, res) => {
     const decryptedRaffles = raffles.map(r => {
       if (r.user && r.user.name) r.user.name = decrypt(r.user.name);
       return { ...r, soldTickets: r._count?.tickets || 0 };
+    });
+
+    // Boost ordering (rotación diaria si hay muchos unlimited)
+    const now = Date.now();
+    const dayKey = Number(new Date().toISOString().slice(0, 10).replace(/-/g, '')) || 0;
+    const rotationScore = (id) => {
+      const n = Number(id) || 0;
+      return (Math.imul(n, 1103515245) + dayKey) >>> 0;
+    };
+    decryptedRaffles.sort((a, b) => {
+      const aBoost = a?.style?.boost;
+      const bBoost = b?.style?.boost;
+      const aExp = aBoost?.expiresAt ? Date.parse(aBoost.expiresAt) : 0;
+      const bExp = bBoost?.expiresAt ? Date.parse(bBoost.expiresAt) : 0;
+      const aActive = aExp && aExp > now;
+      const bActive = bExp && bExp > now;
+      if (aActive !== bActive) return aActive ? -1 : 1;
+
+      if (aActive && bActive) {
+        const ra = rotationScore(a.id);
+        const rb = rotationScore(b.id);
+        if (ra !== rb) return ra - rb;
+      }
+
+      const aAt = aBoost?.boostedAt ? Date.parse(aBoost.boostedAt) : 0;
+      const bAt = bBoost?.boostedAt ? Date.parse(bBoost.boostedAt) : 0;
+      if (aAt !== bAt) return bAt - aAt;
+      return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
     });
 
     res.json(decryptedRaffles);
@@ -786,8 +882,27 @@ app.post('/auth/2fa', async (req, res) => {
 
 // CRUD para rifas
 app.post('/raffles', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
-  const { title, description, ticketPrice, totalTickets, style, lottery } = req.body;
-  if (!title || !description) {
+  const {
+    title,
+    description,
+    prize,
+    ticketPrice,
+    price,
+    totalTickets,
+    style,
+    lottery,
+    terms,
+    digits,
+    startDate,
+    endDate,
+    securityCode,
+    instantWins,
+    minTickets,
+    paymentMethods
+  } = req.body || {};
+
+  const rafflePrize = description || prize;
+  if (!title || !rafflePrize) {
     return res.status(400).json({ error: 'Faltan datos requeridos' });
   }
   
@@ -799,19 +914,102 @@ app.post('/raffles', authenticateToken, authorizeRole(['admin', 'superadmin']), 
   }
 
   try {
-    const raffle = await prisma.raffle.create({ 
-      data: { 
-        title, 
-        prize: description,
-        ticketPrice: Number(ticketPrice) || 0,
+    const actorRole = String(req.user?.role || '').toLowerCase();
+    const actorId = req.user?.userId;
+
+    if (actorRole !== 'superadmin') {
+      const planConfig = await getPlanConfig();
+      const actor = await prisma.user.findUnique({ where: { id: actorId }, select: { adminPlan: true } });
+      const plan = normalizeAdminPlan(actor?.adminPlan, planConfig);
+      if (!plan) return res.status(403).json({ error: 'Admin sin plan activo. Contacta al superadmin.' });
+    }
+
+    const nextStyle = {
+      ...(style || {}),
+      ...(digits !== undefined ? { digits } : {}),
+      ...(startDate ? { startDate } : {}),
+      ...(endDate ? { endDate } : {}),
+      ...(securityCode ? { securityCode } : {}),
+      ...(instantWins ? { instantWins } : {}),
+      ...(minTickets !== undefined ? { minTickets } : {}),
+      ...(paymentMethods ? { paymentMethods } : {})
+    };
+
+    const raffle = await prisma.raffle.create({
+      data: {
+        title,
+        prize: rafflePrize,
+        ticketPrice: Number(ticketPrice ?? price) || 0,
         totalTickets: ticketsCount,
         lottery,
-        style: style || {}
-      } 
+        terms: terms || null,
+        style: nextStyle,
+        userId: actorId,
+        status: 'draft',
+        activatedAt: null,
+        closedAt: null
+      }
     });
-    res.status(201).json({ message: 'Rifa creada', raffle });
+
+    res.status(201).json({ message: 'Rifa creada (borrador)', raffle });
   } catch (error) {
+    console.error(error);
     res.status(500).json({ error: 'Error al crear rifa' });
+  }
+});
+
+// Boost a raffle (24h or 7d). Admin can boost own raffles; superadmin can boost any.
+app.post('/admin/raffles/:id/boost', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  const raffleId = Number(req.params.id);
+  const duration = String(req.body?.duration || '24h').toLowerCase();
+  const actorId = req.user?.userId;
+  const actorRole = String(req.user?.role || '').toLowerCase();
+
+  if (!raffleId) return res.status(400).json({ error: 'ID inválido' });
+  if (!['24h', '7d'].includes(duration)) return res.status(400).json({ error: 'Duración inválida' });
+
+  try {
+    const raffle = await prisma.raffle.findUnique({ where: { id: raffleId } });
+    if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
+    if (String(raffle.status || '').toLowerCase() !== 'active') {
+      return res.status(400).json({ error: 'Solo puedes destacar rifas activas. Actívala primero.' });
+    }
+    if (actorRole !== 'superadmin' && raffle.userId !== actorId) {
+      return res.status(403).json({ error: 'No puedes destacar rifas de otros usuarios.' });
+    }
+
+    const planConfig = await getPlanConfig();
+    if (actorRole !== 'superadmin') {
+      const actor = await prisma.user.findUnique({ where: { id: actorId }, select: { adminPlan: true } });
+      const plan = normalizeAdminPlan(actor?.adminPlan, planConfig);
+      if (!plan) return res.status(403).json({ error: 'Admin sin plan activo.' });
+      const boosts = Number(plan.boostCreditsRemaining) || 0;
+      if (boosts <= 0) return res.status(403).json({ error: 'No tienes boosts disponibles.' });
+
+      const now = Date.now();
+      const expiresAt = new Date(now + (duration === '7d' ? 7 : 1) * 24 * 60 * 60 * 1000).toISOString();
+      const boostedAt = new Date(now).toISOString();
+      const nextStyle = { ...(raffle.style || {}), boost: { expiresAt, boostedAt, duration } };
+      const nextPlan = { ...plan, boostCreditsRemaining: boosts - 1 };
+
+      const updated = await prisma.$transaction(async (tx) => {
+        await tx.user.update({ where: { id: actorId }, data: { adminPlan: nextPlan } });
+        return tx.raffle.update({ where: { id: raffleId }, data: { style: nextStyle } });
+      });
+
+      return res.json({ message: 'Rifa destacada', raffle: updated, boost: nextStyle.boost, boostsRemaining: nextPlan.boostCreditsRemaining });
+    }
+
+    // Superadmin boost sin consumir créditos
+    const now = Date.now();
+    const expiresAt = new Date(now + (duration === '7d' ? 7 : 1) * 24 * 60 * 60 * 1000).toISOString();
+    const boostedAt = new Date(now).toISOString();
+    const nextStyle = { ...(raffle.style || {}), boost: { expiresAt, boostedAt, duration } };
+    const updated = await prisma.raffle.update({ where: { id: raffleId }, data: { style: nextStyle } });
+    return res.json({ message: 'Rifa destacada', raffle: updated, boost: nextStyle.boost });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al destacar rifa' });
   }
 });
 
@@ -1476,31 +1674,76 @@ app.get('/admin/bank-details', async (req, res) => {
 
 app.get('/admin/raffles', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
   try {
-    const raffles = await prisma.raffle.findMany({ orderBy: { createdAt: 'desc' }, include: { _count: { select: { tickets: true } } } });
+    const actorRole = String(req.user?.role || '').toLowerCase();
+    const actorId = req.user?.userId;
+    const where = actorRole === 'superadmin' ? {} : { userId: actorId };
+    const raffles = await prisma.raffle.findMany({ where, orderBy: { createdAt: 'desc' }, include: { _count: { select: { tickets: true } } } });
     res.json(raffles.map(r => ({ ...r, soldTickets: r._count?.tickets || 0 })));
   } catch (error) {
     res.status(500).json({ error: 'Error al obtener rifas' });
   }
 });
 
-app.post('/raffles', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+// Activar rifa (consume cupos y aplica límite semanal para unlimited)
+app.post('/admin/raffles/:id/activate', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  const raffleId = Number(req.params.id);
+  if (!raffleId) return res.status(400).json({ error: 'ID inválido' });
+
   try {
-    const { title, price, description, totalTickets, startDate, endDate, securityCode, lottery, instantWins, terms } = req.body;
-    const raffle = await prisma.raffle.create({
-      data: {
-        title,
-        prize: description, // Mapping description to prize for now or add description field to schema
-        ticketPrice: Number(price),
-        totalTickets: Number(totalTickets),
-        lottery,
-        terms,
-        style: { instantWins } // Storing instantWins in style JSON for now
+    const actorRole = String(req.user?.role || '').toLowerCase();
+    const actorId = req.user?.userId;
+
+    const raffle = await prisma.raffle.findUnique({ where: { id: raffleId } });
+    if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
+    if (actorRole !== 'superadmin' && raffle.userId !== actorId) {
+      return res.status(403).json({ error: 'No puedes activar rifas de otros usuarios.' });
+    }
+
+    const currentStatus = String(raffle.status || '').toLowerCase();
+    if (currentStatus === 'active') return res.status(400).json({ error: 'La rifa ya está activa.' });
+    if (currentStatus === 'closed') return res.status(400).json({ error: 'La rifa está cerrada.' });
+
+    const now = new Date();
+
+    if (actorRole === 'superadmin') {
+      const updated = await prisma.raffle.update({ where: { id: raffleId }, data: { status: 'active', activatedAt: now } });
+      return res.json({ message: 'Rifa activada', raffle: updated });
+    }
+
+    const planConfig = await getPlanConfig();
+    const actor = await prisma.user.findUnique({ where: { id: actorId }, select: { adminPlan: true } });
+    const plan = normalizeAdminPlan(actor?.adminPlan, planConfig);
+    if (!plan) return res.status(403).json({ error: 'Admin sin plan activo. Contacta al superadmin.' });
+
+    if (plan.tier === 'unlimited') {
+      const limit = Number(planConfig.unlimitedWeeklyRaffleLimit) || 3;
+      const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      const activatedLast7d = await prisma.raffle.count({
+        where: {
+          userId: actorId,
+          activatedAt: { gte: since }
+        }
+      });
+      if (activatedLast7d >= limit) {
+        return res.status(403).json({ error: `Límite semanal alcanzado (${limit} activas/7 días).` });
       }
+    } else {
+      const remaining = Number(plan.raffleCreditsRemaining) || 0;
+      if (remaining <= 0) return res.status(403).json({ error: 'No tienes cupos disponibles para activar esta rifa.' });
+    }
+
+    const updated = await prisma.$transaction(async (tx) => {
+      if (plan.tier !== 'unlimited') {
+        const nextPlan = { ...plan, raffleCreditsRemaining: Math.max(0, Number(plan.raffleCreditsRemaining || 0) - 1) };
+        await tx.user.update({ where: { id: actorId }, data: { adminPlan: nextPlan } });
+      }
+      return tx.raffle.update({ where: { id: raffleId }, data: { status: 'active', activatedAt: now } });
     });
-    res.json(raffle);
+
+    return res.json({ message: 'Rifa activada', raffle: updated });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: 'Error al crear rifa' });
+    res.status(500).json({ error: 'Error al activar rifa' });
   }
 });
 
@@ -1508,17 +1751,25 @@ app.patch('/admin/raffles/:id', authenticateToken, authorizeRole(['admin', 'supe
   const { id } = req.params;
   const data = req.body;
   try {
+    const actorRole = String(req.user?.role || '').toLowerCase();
+    const actorId = req.user?.userId;
+    const raffle = await prisma.raffle.findUnique({ where: { id: Number(id) }, select: { userId: true } });
+    if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
+    if (actorRole !== 'superadmin' && raffle.userId !== actorId) {
+      return res.status(403).json({ error: 'No puedes editar rifas de otros usuarios.' });
+    }
+
     // Handle style update specifically if nested
     if (data.style) {
       const current = await prisma.raffle.findUnique({ where: { id: Number(id) }, select: { style: true } });
       data.style = { ...(current?.style || {}), ...data.style };
     }
     
-    const raffle = await prisma.raffle.update({
+    const updatedRaffle = await prisma.raffle.update({
       where: { id: Number(id) },
       data
     });
-    res.json(raffle);
+    res.json(updatedRaffle);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Error al actualizar rifa' });
@@ -1944,6 +2195,16 @@ app.post('/raffles/:id/close', authenticateToken, authorizeRole(['admin', 'super
     const raffle = await prisma.raffle.findUnique({ where: { id: Number(id) } });
     if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
 
+    const actorRole = String(req.user?.role || '').toLowerCase();
+    const actorId = req.user?.userId;
+    if (actorRole !== 'superadmin' && raffle.userId !== actorId) {
+      return res.status(403).json({ error: 'No puedes cerrar rifas de otros usuarios.' });
+    }
+
+    const currentStatus = String(raffle.status || '').toLowerCase();
+    if (currentStatus === 'closed') return res.status(400).json({ error: 'La rifa ya está cerrada.' });
+    if (currentStatus !== 'active') return res.status(400).json({ error: 'Solo puedes cerrar rifas activas.' });
+
     // 1. Buscar tickets vendidos
     const tickets = await prisma.ticket.findMany({ where: { raffleId: Number(id), status: 'approved' } });
     if (tickets.length === 0) return res.status(400).json({ error: 'No hay tickets vendidos para sortear' });
@@ -1956,8 +2217,10 @@ app.post('/raffles/:id/close', authenticateToken, authorizeRole(['admin', 'super
     // Nota: Esto es un sorteo interno. Si es por lotería externa, el admin usa "Publicar Ganador" manualmente.
     // Pero si usa este botón "Cerrar Rifa", asumimos que quiere que el sistema elija.
     
-    // Opcional: Marcar rifa como cerrada? No tenemos campo status en Raffle schema aun, asumimos logica de negocio.
-    // Vamos a devolver el ganador para que el admin lo confirme.
+    await prisma.raffle.update({
+      where: { id: Number(id) },
+      data: { status: 'closed', closedAt: new Date() }
+    });
     
     res.json({ 
       message: 'Sorteo realizado', 
@@ -2104,12 +2367,25 @@ app.patch('/superadmin/settings/modules', authenticateToken, authorizeRole(['sup
 
 app.patch('/superadmin/settings/company', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
   try {
-    const company = req.body;
+    const incoming = req.body && typeof req.body === 'object' ? req.body : {};
+    const current = await prisma.systemSettings.findUnique({ where: { id: 1 } });
+    const currentCompany = current?.company && typeof current.company === 'object' ? current.company : {};
+
+    const incomingPlanConfig = incoming?.planConfig && typeof incoming.planConfig === 'object' ? incoming.planConfig : null;
+    const currentPlanConfig = currentCompany?.planConfig && typeof currentCompany.planConfig === 'object' ? currentCompany.planConfig : {};
+
+    const mergedCompany = { ...currentCompany, ...incoming };
+    if (incomingPlanConfig) {
+      mergedCompany.planConfig = { ...currentPlanConfig, ...incomingPlanConfig };
+    }
+
     const settings = await prisma.systemSettings.upsert({
       where: { id: 1 },
-      update: { company },
-      create: { branding: {}, modules: {}, company }
+      update: { company: mergedCompany },
+      create: { branding: {}, modules: {}, company: mergedCompany }
     });
+
+    cachedPlanConfig.loadedAt = 0;
     res.json(settings);
   } catch (error) {
     res.status(500).json({ error: 'Error al guardar datos de empresa' });
@@ -2178,6 +2454,22 @@ app.patch('/superadmin/users/:id/status', authenticateToken, authorizeRole(['sup
     res.json(user);
   } catch (error) {
     res.status(500).json({ error: 'Error al actualizar estado de usuario' });
+  }
+});
+
+// Asignar o actualizar plan a un admin (solo superadmin)
+app.patch('/superadmin/users/:id/plan', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
+  const { id } = req.params;
+  try {
+    const planConfig = await getPlanConfig();
+    const incoming = req.body || {};
+    const plan = normalizeAdminPlan(incoming, planConfig);
+    if (!plan) return res.status(400).json({ error: 'Plan inválido' });
+    const user = await prisma.user.update({ where: { id: Number(id) }, data: { adminPlan: plan } });
+    res.json(user);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al actualizar plan de usuario' });
   }
 });
 
@@ -2660,6 +2952,7 @@ app.get('/me', authenticateToken, async (req, res) => {
         email: true,
         name: true,
         role: true,
+        adminPlan: true,
         balance: true,
         avatar: true,
         bio: true,
