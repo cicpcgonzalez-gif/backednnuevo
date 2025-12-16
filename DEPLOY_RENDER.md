@@ -60,3 +60,9 @@ Y ejecutar:
 ## 7) Nota sobre la App móvil
 
 Este despliegue NO genera APK ni publica nada en stores. Solo deja la API corriendo en la nube.
+
+## 8) Planes de acceso (admins)
+
+Si necesitas definir niveles de acceso para admins (soporte, pagos, operaciones, superadmin), revisa:
+
+- ACCESS_PLANS.md
