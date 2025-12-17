@@ -8,6 +8,8 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const compression = require('compression');
 const crypto = require('crypto');
+const multer = require('multer');
+const sharp = require('sharp');
 const FraudEngine = require('./utils/fraudEngine');
 const paymentService = require('./services/paymentService');
 
@@ -72,6 +74,22 @@ async function ensureDbColumns() {
 
     await prisma.$executeRawUnsafe('UPDATE "Raffle" SET "status"=\'active\' WHERE "status" IS NULL;');
     await prisma.$executeRawUnsafe('UPDATE "Raffle" SET "activatedAt"="createdAt" WHERE "activatedAt" IS NULL AND "status"=\'active\';');
+
+    // Reacciones de rifas (LIKE/HEART)
+    await prisma.$executeRawUnsafe(`
+      CREATE TABLE IF NOT EXISTS "RaffleReaction" (
+        "id" SERIAL PRIMARY KEY,
+        "type" TEXT NOT NULL,
+        "userId" INTEGER NOT NULL,
+        "raffleId" INTEGER NOT NULL,
+        "createdAt" TIMESTAMP NOT NULL DEFAULT NOW(),
+        CONSTRAINT "RaffleReaction_user_raffle_unique" UNIQUE ("userId", "raffleId"),
+        CONSTRAINT "RaffleReaction_user_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE,
+        CONSTRAINT "RaffleReaction_raffle_fkey" FOREIGN KEY ("raffleId") REFERENCES "Raffle"("id") ON DELETE CASCADE
+      );
+    `);
+    await prisma.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS "RaffleReaction_raffle_createdAt_idx" ON "RaffleReaction"("raffleId", "createdAt");');
+    await prisma.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS "RaffleReaction_raffle_type_idx" ON "RaffleReaction"("raffleId", "type");');
   } catch (e) {
     console.error('[DB] ensureDbColumns adminPlan failed:', e?.message || e);
   }
@@ -141,6 +159,13 @@ function normalizePaymentMethods(value) {
   return [];
 }
 
+function getMinTicketsPerPurchaseFromStyle(style) {
+  const safeStyle = style && typeof style === 'object' ? style : {};
+  const raw = safeStyle.minTickets == null ? 1 : Number(safeStyle.minTickets);
+  const parsed = Number.isFinite(raw) ? Math.floor(raw) : 1;
+  return Math.max(1, parsed);
+}
+
 const app = express();
 
 console.log('🔒 Security Module Loaded: Encryption Enabled');
@@ -192,13 +217,92 @@ const loginLimiter = rateLimit({
 // Inicializar Prisma
 const prisma = new PrismaClient();
 
-app.use(express.json());
+// Subidas grandes (imagenes) se manejan por multipart; igual aumentamos el límite JSON para data URLs/base64.
+app.use(express.json({ limit: '25mb' }));
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 
 const SUPERADMIN_EMAIL = 'rifa@megarifasapp.com';
 const SUPERADMIN_PASSWORD = 'rifasadmin123';
 const SUPERADMIN_ROLE = 'superadmin';
+
+const RAFFLE_ACTIVE_TTL_DAYS = Number(process.env.RAFFLE_ACTIVE_TTL_DAYS || 30);
+const RAFFLE_PURGE_AFTER_DAYS = Number(process.env.RAFFLE_PURGE_AFTER_DAYS || 30);
+const RAFFLE_HOUSEKEEPING_MIN_INTERVAL_MS = Number(process.env.RAFFLE_HOUSEKEEPING_MIN_INTERVAL_MS || 60_000);
+let lastRafflesHousekeepingAt = 0;
+
+const GLOBAL_BOOST_MAX_ACTIVE_USERS = Number(process.env.GLOBAL_BOOST_MAX_ACTIVE_USERS || 15);
+const GLOBAL_BOOST_COOLDOWN_DAYS = Number(process.env.GLOBAL_BOOST_COOLDOWN_DAYS || 7);
+const GLOBAL_BOOST_DURATION_HOURS = Number(process.env.GLOBAL_BOOST_DURATION_HOURS || 24);
+
+const daysToMs = (days) => Number(days) * 24 * 60 * 60 * 1000;
+
+async function getGlobalBoostStatusByUserIds(userIds) {
+  const ids = Array.from(new Set((Array.isArray(userIds) ? userIds : [])
+    .map((n) => Number(n))
+    .filter(Number.isFinite)));
+  if (!ids.length) return new Map();
+
+  const now = new Date();
+  const rows = await prisma.userBoost.groupBy({
+    by: ['userId'],
+    where: { userId: { in: ids }, endAt: { gt: now } },
+    _max: { endAt: true }
+  });
+
+  return new Map(rows.map((r) => [r.userId, { isBoosted: true, boostEndsAt: r._max?.endAt || null }]));
+}
+
+async function getGlobalBoostSlotsSnapshot() {
+  const now = new Date();
+  const rows = await prisma.userBoost.groupBy({
+    by: ['userId'],
+    where: { endAt: { gt: now } },
+    _max: { endAt: true }
+  });
+  const activeUserIds = new Set(rows.map((r) => r.userId));
+  return { activeUsersCount: activeUserIds.size, activeUserIds };
+}
+
+async function runRafflesHousekeeping() {
+  const nowMs = Date.now();
+  if (nowMs - lastRafflesHousekeepingAt < RAFFLE_HOUSEKEEPING_MIN_INTERVAL_MS) return;
+  lastRafflesHousekeepingAt = nowMs;
+
+  const now = new Date(nowMs);
+  try {
+    // 1) Cerrar rifas activas vencidas (por antigüedad)
+    if (Number.isFinite(RAFFLE_ACTIVE_TTL_DAYS) && RAFFLE_ACTIVE_TTL_DAYS > 0) {
+      const expireBefore = new Date(nowMs - daysToMs(RAFFLE_ACTIVE_TTL_DAYS));
+      await prisma.raffle.updateMany({
+        where: { status: 'active', createdAt: { lte: expireBefore } },
+        data: { status: 'closed', closedAt: now }
+      });
+    }
+
+    // 2) Purge de rifas cerradas antiguas
+    if (Number.isFinite(RAFFLE_PURGE_AFTER_DAYS) && RAFFLE_PURGE_AFTER_DAYS > 0) {
+      const purgeBefore = new Date(nowMs - daysToMs(RAFFLE_PURGE_AFTER_DAYS));
+      const oldClosed = await prisma.raffle.findMany({
+        where: { status: { not: 'active' }, closedAt: { not: null, lte: purgeBefore } },
+        select: { id: true },
+        take: 200
+      });
+      const ids = oldClosed.map(r => r.id);
+      if (ids.length) {
+        await prisma.$transaction([
+          prisma.winner.deleteMany({ where: { raffleId: { in: ids } } }),
+          prisma.ticket.deleteMany({ where: { raffleId: { in: ids } } }),
+          prisma.raffle.deleteMany({ where: { id: { in: ids } } })
+        ]);
+      }
+    }
+  } catch (e) {
+    // Permitir reintento rápido si algo falló
+    lastRafflesHousekeepingAt = 0;
+    console.error('[RAFFLES][HOUSEKEEPING] Error:', e);
+  }
+}
 
 const VENEZUELA_STATES = [
   'Amazonas', 'Anzoategui', 'Apure', 'Aragua', 'Barinas', 'Bolivar', 'Carabobo', 'Cojedes',
@@ -228,6 +332,172 @@ function authorizeRole(roles) {
     }
     next();
   };
+}
+
+// --- IMAGE UPLOAD (PROCESSING) ---
+// Nota: “sin restricciones” no puede ser infinito en la práctica.
+// Permitimos un tamaño alto pero razonable para proteger el servidor; lo guardado SIEMPRE se normaliza.
+const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 30 * 1024 * 1024); // 30MB
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_UPLOAD_BYTES }
+});
+
+async function processImageToJpegDataUrl(inputBuffer) {
+  const maxBytes = Number(process.env.IMAGE_MAX_BYTES || 450 * 1024); // ~450KB
+  const baseMaxWidth = Number(process.env.IMAGE_MAX_WIDTH || 1400);
+  const baseMaxHeight = Number(process.env.IMAGE_MAX_HEIGHT || 1400);
+  const startQuality = Number(process.env.IMAGE_JPEG_QUALITY || 78);
+
+  const clampInt = (n, min, max) => {
+    const v = Number(n);
+    if (!Number.isFinite(v)) return min;
+    return Math.max(min, Math.min(max, Math.floor(v)));
+  };
+
+  // Estrategia (garantizada):
+  // 1) Mantener proporción (fit inside)
+  // 2) Bajar calidad gradualmente
+  // 3) Si aún pesa demasiado, reducir dimensiones y repetir
+  // 4) No devolvemos un resultado "pesado" a propósito: seguimos reduciendo hasta cumplir o llegar a mínimos.
+
+  const minDim = clampInt(process.env.IMAGE_MIN_DIM || 320, 200, 800);
+  const minQuality = clampInt(process.env.IMAGE_MIN_QUALITY || 25, 10, 60);
+  const maxRounds = clampInt(process.env.IMAGE_MAX_ROUNDS || 12, 3, 30);
+
+  const qStart = clampInt(startQuality, minQuality, 90);
+  const qualitySteps = [];
+  for (let q = qStart; q >= minQuality; q -= 6) qualitySteps.push(q);
+  if (!qualitySteps.includes(minQuality)) qualitySteps.push(minQuality);
+
+  let currentW = clampInt(baseMaxWidth, minDim, 4000);
+  let currentH = clampInt(baseMaxHeight, minDim, 4000);
+  let lastBuffer = null;
+
+  for (let round = 0; round < maxRounds; round++) {
+    for (const q of qualitySteps) {
+      const out = await sharp(inputBuffer)
+        .rotate()
+        .resize({ width: currentW, height: currentH, fit: 'inside', withoutEnlargement: true })
+        .jpeg({ quality: clampInt(q, minQuality, 90), mozjpeg: true })
+        .toBuffer();
+
+      lastBuffer = out;
+      if (out.length <= maxBytes) {
+        return {
+          dataUrl: `data:image/jpeg;base64,${out.toString('base64')}`,
+          bytes: out.length,
+          maxBytes
+        };
+      }
+    }
+
+    // Reducir dimensiones y volver a intentar
+    const nextW = Math.max(minDim, Math.floor(currentW * 0.85));
+    const nextH = Math.max(minDim, Math.floor(currentH * 0.85));
+    if (nextW === currentW && nextH === currentH) break;
+    currentW = nextW;
+    currentH = nextH;
+  }
+
+  return {
+    dataUrl: `data:image/jpeg;base64,${(lastBuffer || Buffer.alloc(0)).toString('base64')}`,
+    bytes: lastBuffer ? lastBuffer.length : 0,
+    maxBytes
+  };
+}
+
+async function processKycImageToJpegDataUrl(inputBuffer) {
+  const maxBytes = Number(process.env.KYC_IMAGE_MAX_BYTES || 900 * 1024); // ~900KB (documentos requieren más nitidez)
+  const baseMaxWidth = Number(process.env.KYC_IMAGE_MAX_WIDTH || 1800);
+  const baseMaxHeight = Number(process.env.KYC_IMAGE_MAX_HEIGHT || 1800);
+  const startQuality = Number(process.env.KYC_IMAGE_JPEG_QUALITY || 82);
+
+  const clampInt = (n, min, max) => {
+    const v = Number(n);
+    if (!Number.isFinite(v)) return min;
+    return Math.max(min, Math.min(max, Math.floor(v)));
+  };
+
+  const minDim = clampInt(process.env.KYC_IMAGE_MIN_DIM || 640, 320, 1400);
+  const minQuality = clampInt(process.env.KYC_IMAGE_MIN_QUALITY || 35, 15, 75);
+  const maxRounds = clampInt(process.env.KYC_IMAGE_MAX_ROUNDS || 12, 3, 30);
+
+  const qStart = clampInt(startQuality, minQuality, 92);
+  const qualitySteps = [];
+  for (let q = qStart; q >= minQuality; q -= 5) qualitySteps.push(q);
+  if (!qualitySteps.includes(minQuality)) qualitySteps.push(minQuality);
+
+  let currentW = clampInt(baseMaxWidth, minDim, 5000);
+  let currentH = clampInt(baseMaxHeight, minDim, 5000);
+  let lastBuffer = null;
+
+  for (let round = 0; round < maxRounds; round++) {
+    for (const q of qualitySteps) {
+      const out = await sharp(inputBuffer)
+        .rotate()
+        .resize({ width: currentW, height: currentH, fit: 'inside', withoutEnlargement: true })
+        .jpeg({ quality: clampInt(q, minQuality, 92), mozjpeg: true })
+        .toBuffer();
+
+      lastBuffer = out;
+      if (out.length <= maxBytes) {
+        return {
+          dataUrl: `data:image/jpeg;base64,${out.toString('base64')}`,
+          bytes: out.length,
+          maxBytes
+        };
+      }
+    }
+
+    const nextW = Math.max(minDim, Math.floor(currentW * 0.88));
+    const nextH = Math.max(minDim, Math.floor(currentH * 0.88));
+    if (nextW === currentW && nextH === currentH) break;
+    currentW = nextW;
+    currentH = nextH;
+  }
+
+  return {
+    dataUrl: `data:image/jpeg;base64,${(lastBuffer || Buffer.alloc(0)).toString('base64')}`,
+    bytes: lastBuffer ? lastBuffer.length : 0,
+    maxBytes
+  };
+}
+
+function dataUrlToBuffer(dataUrlOrBase64) {
+  if (!dataUrlOrBase64) throw new Error('Imagen requerida');
+  const raw = String(dataUrlOrBase64);
+  const parts = raw.split('base64,');
+  const base64 = parts.length === 2 ? parts[1] : raw;
+  // Hard cap: evita explosiones de memoria con strings gigantes.
+  // 40MB base64 ~ 30MB binario aprox.
+  if (base64.length > 40 * 1024 * 1024) throw new Error('Imagen demasiado grande');
+  return Buffer.from(base64, 'base64');
+}
+
+app.post(
+  '/admin/uploads/image',
+  authenticateToken,
+  authorizeRole(['admin', 'superadmin']),
+  upload.single('file'),
+  async (req, res) => {
+    try {
+      if (!req.file || !req.file.buffer) return res.status(400).json({ error: 'Archivo requerido (field: file).' });
+
+      const processed = await processImageToJpegDataUrl(req.file.buffer);
+      res.json({ dataUrl: processed.dataUrl, bytes: processed.bytes, maxBytes: processed.maxBytes });
+    } catch (error) {
+      console.error('[UPLOAD][IMAGE] Error:', error);
+      const msg = String(error?.message || 'Error al procesar imagen');
+      res.status(500).json({ error: msg });
+    }
+  }
+);
+
+function isPrismaMissingTableError(error) {
+  const code = error?.code;
+  const msg = String(error?.message || '');
+  return code === 'P2021' || msg.toLowerCase().includes('does not exist') || msg.toLowerCase().includes('relation');
 }
 
 // Prisma middleware para medir tiempos de consulta y loguear consultas lentas
@@ -694,49 +964,10 @@ app.get('/users', async (req, res) => {
   }
 });
 
-// Perfil público del rifero (vista previa). Requiere autenticación, pero disponible para user/admin/superadmin.
-app.get('/users/public/:id', authenticateToken, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!Number.isFinite(id)) return res.status(400).json({ error: 'ID inválido' });
-
-    const user = await prisma.user.findUnique({
-      where: { id },
-      select: {
-        id: true,
-        publicId: true,
-        name: true,
-        avatar: true,
-        bio: true,
-        socials: true,
-        role: true,
-        securityId: true,
-        identityVerified: true,
-        reputationScore: true,
-        createdAt: true
-      }
-    });
-
-    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
-
-    const rafflesCount = await prisma.raffle.count({ where: { userId: id } });
-    const salesCount = await prisma.ticket.count({ where: { raffle: { userId: id } } });
-    const prizesCount = await prisma.winner.count({ where: { raffle: { userId: id } } });
-
-    const out = {
-      ...user,
-      name: user.name ? decrypt(user.name) : user.name,
-      stats: { raffles: rafflesCount, sales: salesCount, prizes: prizesCount }
-    };
-    res.json(out);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Error al cargar perfil' });
-  }
-});
-
 app.get('/users/public/:id/raffles', authenticateToken, async (req, res) => {
   try {
+    await runRafflesHousekeeping();
+
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'ID inválido' });
 
@@ -768,14 +999,17 @@ app.get('/users/public/:id/raffles', authenticateToken, async (req, res) => {
       const sold = soldByRaffleId.get(r.id) || 0;
       const total = Number(r.totalTickets) || 0;
       const remaining = total ? Math.max(total - sold, 0) : 0;
+      const minTicketsPerPurchase = getMinTicketsPerPurchaseFromStyle(r.style);
       return {
         id: r.id,
         title: r.title,
         description: r.prize || '',
         totalTickets: r.totalTickets,
-        status: r.status,
+        status: remaining === 0 ? 'closed' : r.status,
         style: r.style,
-        stats: { sold, remaining, total }
+        minTicketsPerPurchase,
+        stats: { sold, remaining, total },
+        isSoldOut: remaining === 0
       };
     };
 
@@ -793,6 +1027,8 @@ app.get('/users/public/:id/raffles', authenticateToken, async (req, res) => {
 app.get('/raffles', async (req, res) => {
   const start = Date.now();
   try {
+    await runRafflesHousekeeping();
+
     const raffles = await prisma.raffle.findMany({
       where: { status: 'active' },
       include: {
@@ -814,8 +1050,55 @@ app.get('/raffles', async (req, res) => {
     
     const decryptedRaffles = raffles.map(r => {
       if (r.user && r.user.name) r.user.name = decrypt(r.user.name);
-      return { ...r, soldTickets: r._count?.tickets || 0 };
+      const soldTickets = r._count?.tickets || 0;
+      const totalTickets = Number(r.totalTickets) || 0;
+      const remainingTickets = totalTickets ? Math.max(totalTickets - soldTickets, 0) : 0;
+      const isSoldOut = totalTickets ? remainingTickets === 0 : false;
+      const minTicketsPerPurchase = getMinTicketsPerPurchaseFromStyle(r.style);
+      return { ...r, soldTickets, remainingTickets, isSoldOut, minTicketsPerPurchase, status: isSoldOut ? 'closed' : r.status };
     });
+
+    // Reacciones (LIKE/HEART) por rifa (tabla creada por ensureDbColumns)
+    try {
+      const raffleIds = decryptedRaffles.map((r) => Number(r.id)).filter(Number.isFinite);
+      if (!raffleIds.length) {
+        for (const r of decryptedRaffles) r.reactionCounts = { LIKE: 0, HEART: 0 };
+      } else {
+        const idList = raffleIds.join(',');
+        const grouped = await prisma.$queryRawUnsafe(
+          `SELECT "raffleId", "type", COUNT(*)::int AS count FROM "RaffleReaction" WHERE "raffleId" IN (${idList}) GROUP BY "raffleId", "type"`
+        );
+
+        const countsMap = new Map();
+        for (const g of grouped || []) {
+          const raffleId = Number(g.raffleId);
+          const type = String(g.type || '').toUpperCase();
+          const count = Number(g.count) || 0;
+          if (!countsMap.has(raffleId)) countsMap.set(raffleId, { LIKE: 0, HEART: 0 });
+          const entry = countsMap.get(raffleId);
+          if (type === 'LIKE' || type === 'HEART') entry[type] = count;
+        }
+        for (const r of decryptedRaffles) r.reactionCounts = countsMap.get(Number(r.id)) || { LIKE: 0, HEART: 0 };
+      }
+    } catch (e) {
+      console.warn('[RAFFLE_REACTIONS] No se pudieron cargar reacciones:', e?.message || e);
+      for (const r of decryptedRaffles) r.reactionCounts = { LIKE: 0, HEART: 0 };
+    }
+
+    // Boost global por rifero (UserBoost)
+    try {
+      const userIds = decryptedRaffles.map((r) => r?.user?.id).filter(Number.isFinite);
+      const boostMap = await getGlobalBoostStatusByUserIds(userIds);
+      for (const r of decryptedRaffles) {
+        if (!r.user) continue;
+        const boost = boostMap.get(r.user.id);
+        r.user.isBoosted = !!boost;
+        r.user.boostEndsAt = boost?.boostEndsAt || null;
+      }
+    } catch (e) {
+      // Si la migración aún no existe o falla, no rompemos el listado
+      console.warn('[BOOST] No se pudo cargar boosts globales:', e?.message || e);
+    }
 
     // Boost ordering (rotación diaria si hay muchos unlimited)
     const now = Date.now();
@@ -825,6 +1108,10 @@ app.get('/raffles', async (req, res) => {
       return (Math.imul(n, 1103515245) + dayKey) >>> 0;
     };
     decryptedRaffles.sort((a, b) => {
+      const aUserBoost = !!a?.user?.isBoosted;
+      const bUserBoost = !!b?.user?.isBoosted;
+      if (aUserBoost !== bUserBoost) return aUserBoost ? -1 : 1;
+
       const aBoost = a?.style?.boost;
       const bBoost = b?.style?.boost;
       const aExp = aBoost?.expiresAt ? Date.parse(aBoost.expiresAt) : 0;
@@ -848,6 +1135,211 @@ app.get('/raffles', async (req, res) => {
     res.json(decryptedRaffles);
   } catch (error) {
     res.status(500).json({ error: 'Error al obtener rifas' });
+  }
+});
+
+// --- RAFFLE REACTIONS (LIKE/HEART) ---
+app.post('/raffles/:id/react', authenticateToken, async (req, res) => {
+  try {
+    const raffleId = Number(req.params.id);
+    const userId = req.user?.userId;
+    const type = String(req.body?.type || '').toUpperCase();
+
+    if (!Number.isFinite(raffleId)) return res.status(400).json({ error: 'ID inválido' });
+    if (!['LIKE', 'HEART'].includes(type)) return res.status(400).json({ error: 'Tipo de reacción inválido' });
+
+    const raffle = await prisma.raffle.findUnique({ where: { id: raffleId }, select: { id: true } });
+    if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
+
+    const existingRows = await prisma.$queryRaw`
+      SELECT "id", "type" FROM "RaffleReaction" WHERE "userId"=${userId} AND "raffleId"=${raffleId} LIMIT 1
+    `;
+    const existing = Array.isArray(existingRows) ? existingRows[0] : null;
+
+    if (existing && existing.id) {
+      const existingType = String(existing.type || '').toUpperCase();
+      const existingId = Number(existing.id);
+      if (existingType === type) {
+        await prisma.$executeRaw`DELETE FROM "RaffleReaction" WHERE "id"=${existingId}`;
+        return res.json({ message: 'Reacción eliminada', active: false });
+      }
+
+      await prisma.$executeRaw`UPDATE "RaffleReaction" SET "type"=${type} WHERE "id"=${existingId}`;
+      return res.json({ message: 'Reacción actualizada', active: true });
+    }
+
+    await prisma.$executeRaw`
+      INSERT INTO "RaffleReaction" ("type", "userId", "raffleId") VALUES (${type}, ${userId}, ${raffleId})
+    `;
+    return res.status(201).json({ message: 'Reacción agregada', active: true });
+  } catch (error) {
+    console.error(error);
+    if (isPrismaMissingTableError(error)) {
+      return res.status(503).json({ error: 'Función no disponible: falta aplicar migración de reacciones de rifas (RaffleReaction).' });
+    }
+    return res.status(500).json({ error: 'Error al reaccionar' });
+  }
+});
+
+// --- RATINGS (1-10) ---
+
+app.post('/raffles/:id/rating', authenticateToken, async (req, res) => {
+  const raffleId = Number(req.params.id);
+  const userId = req.user?.userId;
+  const scoreRaw = req.body?.score;
+  const likedCommentsFeature = !!req.body?.likedCommentsFeature;
+
+  if (!Number.isFinite(raffleId)) return res.status(400).json({ error: 'ID inválido' });
+  const score = Math.floor(Number(scoreRaw));
+  if (!Number.isFinite(score) || score < 1 || score > 10) {
+    return res.status(400).json({ error: 'Calificación inválida (1-10)' });
+  }
+
+  try {
+    const raffle = await prisma.raffle.findUnique({
+      where: { id: raffleId },
+      select: { id: true, status: true, userId: true }
+    });
+    if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
+
+    if (String(raffle.status || '').toLowerCase() !== 'closed') {
+      return res.status(403).json({ error: 'Solo puedes calificar cuando la rifa esté cerrada.' });
+    }
+
+    const riferoUserId = raffle.userId;
+    if (!Number.isFinite(riferoUserId)) {
+      return res.status(400).json({ error: 'Esta rifa no tiene rifero asignado.' });
+    }
+
+    const participated = await prisma.ticket.count({ where: { raffleId, userId } });
+    if (participated <= 0) {
+      return res.status(403).json({ error: 'Solo pueden calificar usuarios que participaron (compraron ticket).' });
+    }
+
+    try {
+      const created = await prisma.raffleRating.create({
+        data: {
+          raffleId,
+          raterUserId: userId,
+          riferoUserId,
+          score,
+          likedCommentsFeature
+        }
+      });
+      return res.status(201).json({ message: 'Calificación registrada', rating: created });
+    } catch (e) {
+      if (e?.code === 'P2002') return res.status(409).json({ error: 'Ya calificaste esta rifa.' });
+      throw e;
+    }
+  } catch (error) {
+    if (isPrismaMissingTableError(error)) {
+      return res.status(503).json({ error: 'Función no disponible: falta aplicar migración de calificaciones (RaffleRating).' });
+    }
+    console.error(error);
+    res.status(500).json({ error: 'Error al registrar calificación' });
+  }
+});
+
+app.get('/users/public/:id/rating-summary', async (req, res) => {
+  const riferoUserId = Number(req.params.id);
+  if (!Number.isFinite(riferoUserId)) return res.status(400).json({ error: 'ID inválido' });
+
+  try {
+    const agg = await prisma.raffleRating.aggregate({
+      where: { riferoUserId },
+      _count: { _all: true },
+      _avg: { score: true }
+    });
+
+    return res.json({
+      riferoUserId,
+      avgScore: agg._avg?.score ?? null,
+      count: agg._count?._all ?? 0
+    });
+  } catch (error) {
+    if (isPrismaMissingTableError(error)) {
+      return res.json({ riferoUserId, avgScore: null, count: 0 });
+    }
+    console.error(error);
+    res.status(500).json({ error: 'Error al obtener resumen de calificaciones' });
+  }
+});
+
+// --- BOOST GLOBAL (15 slots + 1/semana) ---
+
+app.get('/boosts/me', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  const userId = req.user?.userId;
+  try {
+    const now = new Date();
+    const active = await prisma.userBoost.findMany({
+      where: { userId, endAt: { gt: now } },
+      orderBy: { endAt: 'desc' },
+      select: { id: true, startAt: true, endAt: true }
+    });
+    const last = await prisma.userBoost.findFirst({
+      where: { userId },
+      orderBy: { startAt: 'desc' },
+      select: { startAt: true }
+    });
+
+    const nextEligibleAt = last?.startAt
+      ? new Date(new Date(last.startAt).getTime() + GLOBAL_BOOST_COOLDOWN_DAYS * 24 * 60 * 60 * 1000)
+      : now;
+
+    res.json({
+      isBoosted: active.length > 0,
+      activeBoosts: active,
+      nextEligibleAt
+    });
+  } catch (error) {
+    if (isPrismaMissingTableError(error)) {
+      return res.status(503).json({ error: 'Función no disponible: falta aplicar migración de boosts (UserBoost).' });
+    }
+    console.error(error);
+    res.status(500).json({ error: 'Error al consultar boost' });
+  }
+});
+
+app.post('/boosts/activate', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  const actorId = req.user?.userId;
+  try {
+    const now = new Date();
+
+    // Cooldown semanal: 1 boost por semana
+    const last = await prisma.userBoost.findFirst({
+      where: { userId: actorId },
+      orderBy: { startAt: 'desc' },
+      select: { startAt: true }
+    });
+    if (last?.startAt) {
+      const eligibleAt = new Date(new Date(last.startAt).getTime() + GLOBAL_BOOST_COOLDOWN_DAYS * 24 * 60 * 60 * 1000);
+      if (now < eligibleAt) {
+        return res.status(403).json({ error: 'Ya usaste tu boost esta semana. Intenta más adelante.', nextEligibleAt: eligibleAt });
+      }
+    }
+
+    // Límite de boosts activos por rifero (safety)
+    const activeCount = await prisma.userBoost.count({ where: { userId: actorId, endAt: { gt: now } } });
+    if (activeCount >= 2) {
+      return res.status(403).json({ error: 'Ya tienes el máximo de boosts activos permitidos.' });
+    }
+
+    // Slots globales: máximo 15 riferos boosteados simultáneamente
+    const snapshot = await getGlobalBoostSlotsSnapshot();
+    const alreadyCountsAsSlot = snapshot.activeUserIds.has(actorId);
+    if (!alreadyCountsAsSlot && snapshot.activeUsersCount >= GLOBAL_BOOST_MAX_ACTIVE_USERS) {
+      return res.status(403).json({ error: 'No hay cupos de boost disponibles. Intenta más tarde.' });
+    }
+
+    const endAt = new Date(now.getTime() + GLOBAL_BOOST_DURATION_HOURS * 60 * 60 * 1000);
+    const created = await prisma.userBoost.create({ data: { userId: actorId, startAt: now, endAt } });
+    return res.status(201).json({ message: 'Boost activado', boost: created });
+  } catch (error) {
+    if (isPrismaMissingTableError(error)) {
+      return res.status(503).json({ error: 'Función no disponible: falta aplicar migración de boosts (UserBoost).' });
+    }
+    console.error(error);
+    res.status(500).json({ error: 'Error al activar boost' });
   }
 });
 
@@ -1190,9 +1682,19 @@ app.post('/raffles', authenticateToken, authorizeRole(['admin', 'superadmin']), 
   
   const maxTickets = 10000;
   const ticketsCount = Number(totalTickets) || 10000;
+
+  const normalizedMinTickets = (() => {
+    const raw = minTickets === '' || minTickets == null ? 1 : Number(minTickets);
+    const parsed = Number.isFinite(raw) ? Math.floor(raw) : 1;
+    return Math.max(1, parsed);
+  })();
   
   if (ticketsCount > maxTickets) {
     return res.status(400).json({ error: `El máximo de tickets permitidos es ${maxTickets}` });
+  }
+
+  if (normalizedMinTickets > ticketsCount) {
+    return res.status(400).json({ error: 'El mínimo de compra no puede ser mayor que el total de tickets.' });
   }
 
   try {
@@ -1213,7 +1715,7 @@ app.post('/raffles', authenticateToken, authorizeRole(['admin', 'superadmin']), 
       ...(endDate ? { endDate } : {}),
       ...(securityCode ? { securityCode } : {}),
       ...(instantWins ? { instantWins } : {}),
-      ...(minTickets !== undefined ? { minTickets } : {}),
+      minTickets: normalizedMinTickets,
       ...(paymentMethods ? { paymentMethods } : {})
     };
 
@@ -1399,8 +1901,34 @@ app.post('/raffles/:id/purchase', authenticateToken, async (req, res) => {
   const qty = Number(quantity);
 
   try {
+    await runRafflesHousekeeping();
+
     const raffle = await prisma.raffle.findUnique({ where: { id: Number(id) } });
     if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
+
+    const style = raffle.style && typeof raffle.style === 'object' ? raffle.style : {};
+    const minTicketsPerPurchase = (() => {
+      const raw = style.minTickets == null ? 1 : Number(style.minTickets);
+      const parsed = Number.isFinite(raw) ? Math.floor(raw) : 1;
+      return Math.max(1, parsed);
+    })();
+
+    if (qty < minTicketsPerPurchase) {
+      return res.status(400).json({ error: `La compra mínima para esta rifa es ${minTicketsPerPurchase}.` });
+    }
+
+    const currentStatus = String(raffle.status || '').toLowerCase();
+    if (currentStatus !== 'active') {
+      return res.status(400).json({ error: 'La rifa está cerrada o no disponible.' });
+    }
+
+    if (Number.isFinite(RAFFLE_ACTIVE_TTL_DAYS) && RAFFLE_ACTIVE_TTL_DAYS > 0) {
+      const expireBefore = new Date(Date.now() - daysToMs(RAFFLE_ACTIVE_TTL_DAYS));
+      if (raffle.createdAt && new Date(raffle.createdAt).getTime() <= expireBefore.getTime()) {
+        await prisma.raffle.update({ where: { id: raffle.id }, data: { status: 'closed', closedAt: new Date() } });
+        return res.status(400).json({ error: 'La rifa está vencida.' });
+      }
+    }
 
     const user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
@@ -1424,6 +1952,8 @@ app.post('/raffles/:id/purchase', authenticateToken, async (req, res) => {
     if (occupiedNumbers.size + qty > maxTickets) {
        return res.status(400).json({ error: 'No hay suficientes tickets disponibles' });
     }
+
+     const willSoldOut = occupiedNumbers.size + qty === maxTickets;
 
     while (newNumbers.length < qty && attempts < maxTickets * 3) {
       const num = crypto.randomInt(1, maxTickets + 1);
@@ -1464,12 +1994,20 @@ app.post('/raffles/:id/purchase', authenticateToken, async (req, res) => {
           }
         });
       }
+
+      if (willSoldOut) {
+        await tx.raffle.update({
+          where: { id: Number(id) },
+          data: { status: 'closed', closedAt: new Date() }
+        });
+      }
     });
 
     res.status(201).json({ 
       message: 'Compra exitosa', 
       numbers: newNumbers,
-      remainingBalance: user.balance - totalCost 
+      remainingBalance: user.balance - totalCost,
+      raffleClosed: willSoldOut
     });
 
   } catch (error) {
@@ -2168,7 +2706,13 @@ app.get('/admin/raffles', authenticateToken, authorizeRole(['admin', 'superadmin
     const actorId = req.user?.userId;
     const where = actorRole === 'superadmin' ? {} : { userId: actorId };
     const raffles = await prisma.raffle.findMany({ where, orderBy: { createdAt: 'desc' }, include: { _count: { select: { tickets: true } } } });
-    res.json(raffles.map(r => ({ ...r, soldTickets: r._count?.tickets || 0 })));
+    res.json(
+      raffles.map((r) => ({
+        ...r,
+        soldTickets: r._count?.tickets || 0,
+        minTicketsPerPurchase: getMinTicketsPerPurchaseFromStyle(r.style)
+      }))
+    );
   } catch (error) {
     res.status(500).json({ error: 'Error al obtener rifas' });
   }
@@ -2630,48 +3174,6 @@ app.get('/winners', async (req, res) => {
   }
 });
 
-// --- ADMIN ANNOUNCEMENTS ---
-
-app.post('/admin/announcements', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
-  const { title, content, imageUrl } = req.body;
-  
-  if (!title || !content) {
-    return res.status(400).json({ error: 'Título y contenido requeridos' });
-  }
-
-  try {
-    const announcement = await prisma.announcement.create({
-      data: {
-        title,
-        content,
-        imageUrl,
-        adminId: req.user.userId
-      }
-    });
-    
-    // Opcional: Enviar push notification automática
-    // sendPushToAll(title, content);
-
-    res.json({ message: 'Anuncio publicado', announcement });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Error al crear anuncio' });
-  }
-});
-
-app.get('/announcements', async (req, res) => {
-  try {
-    const news = await prisma.announcement.findMany({
-      orderBy: { createdAt: 'desc' },
-      take: 20,
-      include: { admin: { select: { name: true } } }
-    });
-    res.json(news);
-  } catch (error) {
-    res.status(500).json({ error: 'Error al obtener noticias' });
-  }
-});
-
 // --- ADMIN PUSH NOTIFICATIONS ---
 
 app.post('/admin/push/broadcast', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
@@ -2846,15 +3348,56 @@ app.get('/wallet', authenticateToken, async (req, res) => {
       where: { id: req.user.userId },
       include: { transactions: { orderBy: { createdAt: 'desc' }, take: 20 } }
     });
-    res.json({ balance: user.balance, transactions: user.transactions });
+    const safeDecrypt = (value) => {
+      if (value == null) return null;
+      try {
+        return decrypt(value);
+      } catch {
+        return value;
+      }
+    };
+
+    const mapped = (user?.transactions || []).map((t) => ({
+      id: t.id,
+      amount: t.amount,
+      currency: t.currency,
+      type: t.type,
+      status: t.status,
+      provider: t.provider,
+      raffleId: t.raffleId,
+      reference: safeDecrypt(t.reference),
+      createdAt: t.createdAt
+    }));
+
+    res.json({ balance: user.balance, transactions: mapped });
   } catch (error) {
     res.status(500).json({ error: 'Error al obtener wallet' });
   }
 });
 
 app.post('/wallet/topup', authenticateToken, async (req, res) => {
-  const { amount } = req.body;
+  const { amount, provider } = req.body;
   if (!amount || amount <= 0) return res.status(400).json({ error: 'Monto inválido' });
+
+  const normalizedProvider = (() => {
+    const p = String(provider || '').trim().toLowerCase();
+    const allowed = new Set(['mobile_payment', 'zelle', 'binance', 'transfer']);
+    return allowed.has(p) ? p : '';
+  })();
+
+  if (!normalizedProvider) {
+    return res.status(400).json({ error: 'Método de recarga inválido' });
+  }
+
+  const providerLabel = normalizedProvider === 'mobile_payment'
+    ? 'Pago móvil'
+    : normalizedProvider === 'transfer'
+      ? 'Transferencia'
+      : normalizedProvider === 'zelle'
+        ? 'Zelle'
+        : normalizedProvider === 'binance'
+          ? 'Binance'
+          : 'Recarga';
 
   try {
     await prisma.$transaction([
@@ -2868,7 +3411,8 @@ app.post('/wallet/topup', authenticateToken, async (req, res) => {
           amount: Number(amount),
           type: 'deposit',
           status: 'approved',
-          reference: encrypt('Recarga de saldo')
+          provider: normalizedProvider,
+          reference: encrypt(`Recarga de saldo (${providerLabel})`)
         }
       })
     ]);
@@ -3102,70 +3646,56 @@ app.post('/superadmin/users/:id/revoke-sessions', authenticateToken, authorizeRo
   res.json({ message: 'Sesiones marcadas para cierre (Efectivo al expirar token actual)' });
 });
 
-// Endpoint público para perfil de usuario
-app.get('/users/public/:id', async (req, res) => {
-  const { id } = req.params;
-  try {
-    const user = await prisma.user.findUnique({
-      where: { id: Number(id) },
-      select: {
-        id: true,
-        name: true,
-        avatar: true,
-        securityId: true,
-        identityVerified: true,
-        reputationScore: true,
-        createdAt: true,
-        bio: true,
-        socials: true
-      }
-    });
-
-    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
-
-    if (user.name) user.name = decrypt(user.name);
-
-    // Calcular estadísticas en tiempo real
-    const rafflesCount = await prisma.raffle.count({ where: { userId: user.id } });
-    
-    // Contar tickets vendidos en todas sus rifas
-    // Primero obtenemos los IDs de sus rifas
-    const userRaffles = await prisma.raffle.findMany({ 
-      where: { userId: user.id },
-      select: { id: true }
-    });
-    const raffleIds = userRaffles.map(r => r.id);
-    
-    const salesCount = await prisma.ticket.count({
-      where: { raffleId: { in: raffleIds } }
-    });
-
-    res.json({
-      ...user,
-      stats: {
-        raffles: rafflesCount,
-        sales: salesCount
-      }
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Error al obtener perfil público' });
-  }
-});
-
 // --- MANUAL PAYMENTS ENDPOINTS ---
 
 // Crear pago manual
 app.post('/raffles/:id/manual-payments', authenticateToken, async (req, res) => {
   const { id } = req.params;
-  const { quantity, reference, note, proof } = req.body;
+  const { quantity, reference, note, proof, provider } = req.body;
   
   if (!quantity || quantity <= 0) return res.status(400).json({ error: 'Cantidad inválida' });
   if (!proof) return res.status(400).json({ error: 'Comprobante requerido' });
 
   try {
+    await runRafflesHousekeeping();
+
     const raffle = await prisma.raffle.findUnique({ where: { id: Number(id) } });
     if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
+
+    const currentStatus = String(raffle.status || '').toLowerCase();
+    if (currentStatus !== 'active') {
+      return res.status(400).json({ error: 'La rifa está cerrada o no disponible.' });
+    }
+
+    const style = raffle.style && typeof raffle.style === 'object' ? raffle.style : {};
+    const minTicketsPerPurchase = (() => {
+      const raw = style.minTickets == null ? 1 : Number(style.minTickets);
+      const parsed = Number.isFinite(raw) ? Math.floor(raw) : 1;
+      return Math.max(1, parsed);
+    })();
+
+    if (Number(quantity) < minTicketsPerPurchase) {
+      return res.status(400).json({ error: `La compra mínima para esta rifa es ${minTicketsPerPurchase}.` });
+    }
+
+    const allowedForRaffle = (() => {
+      const list = normalizePaymentMethods(style.paymentMethods);
+      return list.length ? list : ['mobile_payment'];
+    })();
+
+    const normalizedProvider = (() => {
+      const p = String(provider || '').trim().toLowerCase();
+      const supported = new Set(['mobile_payment', 'zelle', 'binance', 'transfer']);
+      return supported.has(p) ? p : '';
+    })();
+
+    if (!normalizedProvider) {
+      return res.status(400).json({ error: 'Método de pago inválido' });
+    }
+
+    if (!allowedForRaffle.includes(normalizedProvider)) {
+      return res.status(400).json({ error: 'Este método no está habilitado para esta rifa' });
+    }
 
     const amount = Number(raffle.ticketPrice) * Number(quantity);
 
@@ -3175,6 +3705,7 @@ app.post('/raffles/:id/manual-payments', authenticateToken, async (req, res) => 
         amount,
         type: 'manual_payment',
         status: 'pending',
+        provider: normalizedProvider,
         reference: encrypt(reference || `Pago manual para rifa ${id}`),
         proof: encrypt(proof),
         raffleId: raffle.id
@@ -3233,65 +3764,87 @@ cron.schedule('0 13 * * *', async () => {
 
 // --- KYC ROUTES ---
 
-app.post('/kyc/submit', authenticateToken, async (req, res) => {
+// Compat legacy (JSON con data URLs). Recomendado: usar /me/kyc (multipart).
+app.post('/kyc/submit', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
   const { documentType, frontImage, backImage, selfieImage } = req.body;
-  
+
   if (!frontImage || !selfieImage) {
     return res.status(400).json({ error: 'Imágenes requeridas (Frontal y Selfie)' });
   }
 
   try {
-    // Check if already verified or pending
-    const existing = await prisma.kYCRequest.findFirst({
-      where: { 
-        userId: req.user.userId,
-        status: { in: ['pending', 'approved'] }
-      }
-    });
+    const [user, existing] = await Promise.all([
+      prisma.user.findUnique({ where: { id: req.user.userId }, select: { identityVerified: true } }),
+      prisma.kYCRequest.findFirst({
+        where: {
+          userId: req.user.userId,
+          status: { in: ['pending', 'approved'] }
+        },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true, status: true, createdAt: true }
+      })
+    ]);
 
-    if (existing) {
-      if (existing.status === 'approved') return res.status(400).json({ error: 'Ya estás verificado' });
-      return res.status(400).json({ error: 'Ya tienes una solicitud pendiente' });
+    if (user?.identityVerified || existing?.status === 'approved') {
+      return res.json({ message: 'Ya estás verificado', identityVerified: true, request: existing || null });
     }
+    if (existing?.status === 'pending') {
+      return res.json({ message: 'Ya tienes una solicitud pendiente', identityVerified: false, request: existing });
+    }
+
+    const [front, back, selfie] = await Promise.all([
+      processKycImageToJpegDataUrl(dataUrlToBuffer(frontImage)),
+      backImage ? processKycImageToJpegDataUrl(dataUrlToBuffer(backImage)) : Promise.resolve(null),
+      processKycImageToJpegDataUrl(dataUrlToBuffer(selfieImage))
+    ]);
 
     const kyc = await prisma.kYCRequest.create({
       data: {
         userId: req.user.userId,
         documentType: documentType || 'cedula',
-        frontImage: encrypt(frontImage),
-        backImage: backImage ? encrypt(backImage) : null,
-        selfieImage: encrypt(selfieImage),
+        frontImage: encrypt(front.dataUrl),
+        backImage: back ? encrypt(back.dataUrl) : null,
+        selfieImage: encrypt(selfie.dataUrl),
         status: 'pending'
-      }
+      },
+      select: { id: true, status: true, createdAt: true }
     });
 
-    res.status(201).json({ message: 'Solicitud KYC enviada', id: kyc.id });
+    res.status(201).json({ message: 'Solicitud KYC enviada', request: kyc });
   } catch (error) {
-    console.error(error);
+    console.error('[KYC] /kyc/submit error:', error);
+    if (isPrismaMissingTableError(error)) {
+      return res.status(503).json({ error: 'Función no disponible: falta aplicar migración de KYC (KYCRequest).' });
+    }
     res.status(500).json({ error: 'Error al enviar solicitud KYC' });
   }
 });
 
-app.get('/kyc/status', authenticateToken, async (req, res) => {
+app.get('/kyc/status', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
   try {
-    const kyc = await prisma.kYCRequest.findFirst({
-      where: { userId: req.user.userId },
-      orderBy: { createdAt: 'desc' }
-    });
-    
-    if (!kyc) return res.json({ status: 'none', identityVerified: false });
+    const [user, kyc] = await Promise.all([
+      prisma.user.findUnique({ where: { id: req.user.userId }, select: { identityVerified: true } }),
+      prisma.kYCRequest.findFirst({
+        where: { userId: req.user.userId },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true, status: true, rejectionReason: true, createdAt: true, updatedAt: true }
+      })
+    ]);
 
-    res.json({ 
-      status: kyc.status, 
+    if (!kyc) return res.json({ status: 'none', identityVerified: !!user?.identityVerified, request: null });
+
+    res.json({
+      status: kyc.status,
+      identityVerified: !!user?.identityVerified,
       rejectionReason: kyc.rejectionReason,
-      createdAt: kyc.createdAt 
+      request: kyc
     });
   } catch (error) {
     res.status(500).json({ error: 'Error al consultar estado KYC' });
   }
 });
 
-app.get('/admin/kyc/pending', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+app.get('/admin/kyc/pending', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
   try {
     const requests = await prisma.kYCRequest.findMany({
       where: { status: 'pending' },
@@ -3318,7 +3871,7 @@ app.get('/admin/kyc/pending', authenticateToken, authorizeRole(['admin', 'supera
   }
 });
 
-app.post('/admin/kyc/:id/review', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+app.post('/admin/kyc/:id/review', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
   const { status, reason } = req.body; // status: 'approved' | 'rejected'
   
   if (!['approved', 'rejected'].includes(status)) {
@@ -3663,6 +4216,8 @@ app.get('/me', authenticateToken, async (req, res) => {
       where: { id: req.user.userId },
       select: {
         id: true,
+        publicId: true,
+        securityId: true,
         email: true,
         name: true,
         role: true,
@@ -3672,6 +4227,14 @@ app.get('/me', authenticateToken, async (req, res) => {
         bio: true,
         socials: true,
         referralCode: true,
+        identityVerified: true,
+        verified: true,
+        phone: true,
+        address: true,
+        cedula: true,
+        state: true,
+        reputationScore: true,
+        riskScore: true,
         createdAt: true
       }
     });
@@ -3680,12 +4243,140 @@ app.get('/me', authenticateToken, async (req, res) => {
     // Decrypt sensitive data
     if (user.name) user.name = decrypt(user.name);
 
+    // Garantiza que todos tengan un securityId (persistente en DB)
+    if (!user.securityId) {
+      try {
+        const securityId = await generateUniqueSecurityId();
+        const updated = await prisma.user.update({
+          where: { id: user.id },
+          data: { securityId },
+          select: { securityId: true }
+        });
+        user.securityId = updated.securityId;
+      } catch (e) {
+        console.warn('[SECURITY_ID] ensure on /me failed:', e?.message || e);
+      }
+    }
+
     res.json(user);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Error al obtener perfil' });
   }
 });
+
+// --- KYC (Admins) ---
+app.get('/me/kyc', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const [user, latest] = await Promise.all([
+      prisma.user.findUnique({
+        where: { id: req.user.userId },
+        select: { id: true, identityVerified: true }
+      }),
+      prisma.kYCRequest.findFirst({
+        where: { userId: req.user.userId },
+        orderBy: { createdAt: 'desc' },
+        select: {
+          id: true,
+          status: true,
+          documentType: true,
+          rejectionReason: true,
+          createdAt: true,
+          updatedAt: true
+        }
+      })
+    ]);
+
+    res.json({ identityVerified: !!user?.identityVerified, request: latest || null });
+  } catch (error) {
+    console.error('[KYC] get /me/kyc error:', error);
+    if (isPrismaMissingTableError(error)) {
+      return res.status(503).json({ error: 'Función no disponible: falta aplicar migración de KYC (KYCRequest).' });
+    }
+    res.status(500).json({ error: 'Error al obtener KYC' });
+  }
+});
+
+app.post(
+  '/me/kyc',
+  authenticateToken,
+  authorizeRole(['admin', 'superadmin']),
+  upload.fields([
+    { name: 'front', maxCount: 1 },
+    { name: 'back', maxCount: 1 },
+    { name: 'selfie', maxCount: 1 }
+  ]),
+  async (req, res) => {
+    try {
+      const [user, existing] = await Promise.all([
+        prisma.user.findUnique({ where: { id: req.user.userId }, select: { identityVerified: true } }),
+        prisma.kYCRequest.findFirst({
+          where: { userId: req.user.userId, status: { in: ['pending', 'approved'] } },
+          orderBy: { createdAt: 'desc' },
+          select: { id: true, status: true, createdAt: true }
+        })
+      ]);
+
+      if (user?.identityVerified || existing?.status === 'approved') {
+        return res.json({ message: 'Ya estás verificado', identityVerified: true, request: existing || null });
+      }
+      if (existing?.status === 'pending') {
+        return res.json({ message: 'Ya tienes una solicitud pendiente', identityVerified: false, request: existing });
+      }
+
+      const frontBuf = req.files?.front?.[0]?.buffer;
+      const backBuf = req.files?.back?.[0]?.buffer;
+      const selfieBuf = req.files?.selfie?.[0]?.buffer;
+
+      if (!frontBuf || !selfieBuf) {
+        return res.status(400).json({ error: 'Archivos requeridos: front y selfie (back opcional).' });
+      }
+
+      const [front, back, selfie] = await Promise.all([
+        processKycImageToJpegDataUrl(frontBuf),
+        backBuf ? processKycImageToJpegDataUrl(backBuf) : Promise.resolve(null),
+        processKycImageToJpegDataUrl(selfieBuf)
+      ]);
+
+      const created = await prisma.kYCRequest.create({
+        data: {
+          userId: req.user.userId,
+          status: 'pending',
+          documentType: 'cedula',
+          frontImage: encrypt(front.dataUrl),
+          backImage: back ? encrypt(back.dataUrl) : null,
+          selfieImage: encrypt(selfie.dataUrl)
+        },
+        select: { id: true, status: true, createdAt: true }
+      });
+
+      // Audit
+      try {
+        await prisma.auditLog.create({
+          data: {
+            action: 'KYC_SUBMITTED',
+            userEmail: req.user?.email || null,
+            userId: req.user?.userId || null,
+            entity: 'KYCRequest',
+            entityId: String(created.id),
+            severity: 'INFO',
+            detail: `KYC enviado. front=${front.bytes}/${front.maxBytes}B back=${back ? `${back.bytes}/${back.maxBytes}B` : '—'} selfie=${selfie.bytes}/${selfie.maxBytes}B`,
+            ipAddress: req.ip,
+            userAgent: req.headers['user-agent']
+          }
+        });
+      } catch (_e) {}
+
+      res.status(201).json({ message: 'KYC enviado', request: created });
+    } catch (error) {
+      console.error('[KYC] post /me/kyc error:', error);
+      if (isPrismaMissingTableError(error)) {
+        return res.status(503).json({ error: 'Función no disponible: falta aplicar migración de KYC (KYCRequest).' });
+      }
+      res.status(500).json({ error: 'Error al enviar KYC' });
+    }
+  }
+);
 
 app.patch('/me', authenticateToken, async (req, res) => {
   try {
@@ -3732,12 +4423,25 @@ app.delete('/me', authenticateToken, async (req, res) => {
 
 app.get('/me/tickets', authenticateToken, async (req, res) => {
   try {
+    const user = await prisma.user.findUnique({ where: { id: req.user.userId }, select: { securityId: true, publicId: true } });
     const tickets = await prisma.ticket.findMany({
       where: { userId: req.user.userId },
       include: { raffle: true },
       orderBy: { createdAt: 'desc' }
     });
-    res.json(tickets);
+    const buyerSecurityId = user?.securityId || user?.publicId || null;
+    res.json(
+      tickets.map((t) => {
+        const raffle = t.raffle;
+        const digits = raffle?.digits ?? raffle?.style?.digits ?? 4;
+        return {
+          ...t,
+          raffleTitle: raffle?.title || '',
+          digits,
+          buyerSecurityId
+        };
+      })
+    );
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Error al obtener tickets' });
@@ -3781,14 +4485,25 @@ app.get('/me/payments', authenticateToken, async (req, res) => {
   try {
     const payments = await prisma.transaction.findMany({
       where: { userId: req.user.userId },
-      orderBy: { createdAt: 'desc' }
+      orderBy: { createdAt: 'desc' },
+      take: 50
     });
     
-    // Decrypt sensitive data
-    const decryptedPayments = payments.map(p => ({
+    const safeDecrypt = (value) => {
+      if (value == null) return null;
+      try {
+        return decrypt(value);
+      } catch {
+        return value;
+      }
+    };
+
+    // Decrypt sensitive data (if present)
+    const decryptedPayments = payments.map((p) => ({
       ...p,
-      reference: decrypt(p.reference),
-      proof: decrypt(p.proof)
+      provider: p.provider || null,
+      reference: safeDecrypt(p.reference),
+      proof: safeDecrypt(p.proof)
     }));
 
     res.json(decryptedPayments);
@@ -3855,9 +4570,13 @@ app.get('/users/public/:id', async (req, res) => {
     let user = await prisma.user.findUnique({
       where: { publicId: id },
       select: {
+        id: true,
         publicId: true,
         name: true,
         avatar: true,
+        securityId: true,
+        identityVerified: true,
+        reputationScore: true,
         bio: true,
         socials: true,
         createdAt: true,
@@ -3873,9 +4592,13 @@ app.get('/users/public/:id', async (req, res) => {
       user = await prisma.user.findUnique({
         where: { id: Number(id) },
         select: {
+          id: true,
           publicId: true,
           name: true,
           avatar: true,
+          securityId: true,
+          identityVerified: true,
+          reputationScore: true,
           bio: true,
           socials: true,
           createdAt: true,
@@ -3890,16 +4613,38 @@ app.get('/users/public/:id', async (req, res) => {
 
     if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
 
-    let stats = {};
+    // Stats del rifero (para confianza): rifas creadas, tickets vendidos y premios.
+    // Para admin/superadmin mantenemos stats globales como extra, pero sin romper el contrato existente.
+    const rafflesCount = await prisma.raffle.count({ where: { userId: user.id } });
+    const salesCount = await prisma.ticket.count({ where: { raffle: { userId: user.id } } });
+    const prizesCount = await prisma.winner.count({ where: { raffle: { userId: user.id } } });
+
+    let stats = { raffles: rafflesCount, sales: salesCount, prizes: prizesCount };
     if (user.role === 'admin' || user.role === 'superadmin') {
-      const rafflesCount = await prisma.raffle.count();
-      const winnersCount = await prisma.winner.count();
-      stats = { raffles: rafflesCount, prizes: winnersCount };
+      try {
+        const totalRaffles = await prisma.raffle.count();
+        const totalWinners = await prisma.winner.count();
+        stats = { ...stats, totalRaffles, totalWinners };
+      } catch (_e) {
+        // noop
+      }
+    }
+
+    // Boost global por usuario (si existe la tabla)
+    let isBoosted = false;
+    let boostEndsAt = null;
+    try {
+      const boostMap = await getGlobalBoostStatusByUserIds([user.id]);
+      const boost = boostMap.get(user.id);
+      isBoosted = !!boost;
+      boostEndsAt = boost?.boostEndsAt || null;
+    } catch (_e) {
+      // noop
     }
 
     if (user.name) user.name = decrypt(user.name);
 
-    res.json({ ...user, stats });
+    res.json({ ...user, stats, isBoosted, boostEndsAt });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Error al obtener perfil público' });
@@ -4180,6 +4925,81 @@ app.post('/admin/manual-payments/:id/reject', authenticateToken, authorizeRole([
   }
 });
 
+// Listar transacciones (movimientos) - Admin
+app.get('/admin/transactions', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const { status, type, userId, raffleId, limit, q } = req.query;
+
+    const safeDecrypt = (value) => {
+      if (value == null) return null;
+      try {
+        return decrypt(value);
+      } catch {
+        return value;
+      }
+    };
+
+    const normalizeProof = (p) => {
+      if (!p) return null;
+      if (typeof p !== 'string') return null;
+      if (p.startsWith('http') || p.startsWith('data:')) return p;
+      return `data:image/jpeg;base64,${p}`;
+    };
+
+    const where = {};
+    if (status) where.status = String(status);
+    if (type) where.type = String(type);
+    if (userId) where.userId = Number(userId);
+    if (raffleId) where.raffleId = Number(raffleId);
+
+    const take = Math.min(500, Math.max(1, Number(limit) || 200));
+
+    const txs = await prisma.transaction.findMany({
+      where,
+      include: { user: { select: { id: true, name: true, email: true, state: true } } },
+      orderBy: { createdAt: 'desc' },
+      take
+    });
+
+    const mapped = txs.map((t) => {
+      const decryptedReference = safeDecrypt(t.reference);
+      const decryptedProof = safeDecrypt(t.proof);
+      const decryptedUserName = t.user ? safeDecrypt(t.user.name) : null;
+
+      return {
+        id: t.id,
+        amount: t.amount,
+        currency: t.currency,
+        type: t.type,
+        status: t.status,
+        provider: t.provider,
+        raffleId: t.raffleId,
+        userId: t.userId,
+        reference: decryptedReference,
+        proof: normalizeProof(decryptedProof),
+        createdAt: t.createdAt,
+        user: t.user ? { ...t.user, name: decryptedUserName } : null
+      };
+    });
+
+    const needle = String(q || '').trim().toLowerCase();
+    const filtered = needle
+      ? mapped.filter((t) => {
+          const email = String(t?.user?.email || '').toLowerCase();
+          const name = String(t?.user?.name || '').toLowerCase();
+          const ref = String(t?.reference || '').toLowerCase();
+          const typ = String(t?.type || '').toLowerCase();
+          return email.includes(needle) || name.includes(needle) || ref.includes(needle) || typ.includes(needle);
+        })
+      : mapped;
+
+    res.json(filtered);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al listar movimientos' });
+  }
+});
+
 // Endpoint de diagnóstico para Email (Temporal)
 app.get('/debug/test-email', async (req, res) => {
   const { email } = req.query;
@@ -4224,6 +5044,9 @@ async function startServer() {
     console.log('⏳ Intentando conectar a la base de datos...');
     await prisma.$connect();
     console.log('✅ Conexión a base de datos exitosa.');
+
+    // Asegurar tablas/columnas necesarias sin romper despliegues existentes
+    await ensureDbColumns();
   } catch (error) {
     console.error('❌ ERROR CRÍTICO DE BASE DE DATOS:', error);
     console.error('   El servidor seguirá ejecutándose para mostrar logs, pero las consultas fallarán.');

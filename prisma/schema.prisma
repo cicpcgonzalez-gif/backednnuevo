@@ -39,7 +39,11 @@ model User {
   adminPlan         Json?
   announcements     Announcement[]
   raffles           Raffle[]       @relation("UserRaffles")
+  boosts            UserBoost[]
+  ratingsGiven      RaffleRating[] @relation("RaterRatings")
+  ratingsReceived   RaffleRating[] @relation("RiferoRatings")
   reactions         Reaction[]
+  raffleReactions   RaffleReaction[]
   tickets           Ticket[]
   transactions      Transaction[]
   suspiciousActivity SuspiciousActivity[]
@@ -117,6 +121,52 @@ model Raffle {
   user         User?    @relation("UserRaffles", fields: [userId], references: [id])
   tickets      Ticket[]
   winners      Winner[]
+  ratings      RaffleRating[]
+  reactions    RaffleReaction[]
+}
+
+model RaffleReaction {
+  id        Int      @id @default(autoincrement())
+  type      String
+  userId    Int
+  raffleId  Int
+  createdAt DateTime @default(now())
+
+  user   User  @relation(fields: [userId], references: [id])
+  raffle Raffle @relation(fields: [raffleId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, raffleId])
+  @@index([raffleId, createdAt])
+}
+
+model RaffleRating {
+  id                   Int      @id @default(autoincrement())
+  raffleId             Int
+  raterUserId          Int
+  riferoUserId         Int
+  score                Int
+  likedCommentsFeature Boolean  @default(false)
+  createdAt            DateTime @default(now())
+
+  raffle Raffle @relation(fields: [raffleId], references: [id], onDelete: Cascade)
+  rater  User   @relation("RaterRatings", fields: [raterUserId], references: [id], onDelete: Cascade)
+  rifero User   @relation("RiferoRatings", fields: [riferoUserId], references: [id], onDelete: Cascade)
+
+  @@unique([raffleId, raterUserId])
+  @@index([riferoUserId, createdAt])
+}
+
+model UserBoost {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  startAt   DateTime
+  endAt     DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, endAt])
+  @@index([endAt])
 }
 
 model Transaction {
