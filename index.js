@@ -117,6 +117,30 @@ function decrypt(text) {
   }
 }
 
+function safeDecrypt(value) {
+  if (value == null) return value;
+  try {
+    return decrypt(value);
+  } catch (_e) {
+    return value;
+  }
+}
+
+function normalizePaymentMethods(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((m) => String(m || '').trim())
+      .filter(Boolean);
+  }
+  if (typeof value === 'string') {
+    return value
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
 const app = express();
 
 console.log('🔒 Security Module Loaded: Encryption Enabled');
@@ -228,6 +252,7 @@ prisma.$use(async (params, next) => {
 
 const { v4: uuidv4 } = require('uuid');
 const nodemailer = require('nodemailer');
+const ExcelJS = require('exceljs');
 
 // Configuración de transporte de correo (Mock o SMTP)
 let smtpHost = process.env.SMTP_HOST;
@@ -270,8 +295,11 @@ if (!process.env.SMTP_PASS) {
   });
 }
 
-async function sendEmail(to, subject, text, html) {
+async function sendEmail(to, subject, text, html, options = {}) {
   try {
+    const attachments = Array.isArray(options?.attachments) ? options.attachments : undefined;
+    const forceSmtp = options?.forceSmtp === true || (attachments && attachments.length > 0);
+
     // 1. Buscar configuración SMTP personalizada en DB
     let settings = null;
     try {
@@ -285,7 +313,7 @@ async function sendEmail(to, subject, text, html) {
 
     // 1.5. INTENTO DE ENVÍO VÍA RESEND API (HTTP) - Prioridad para evitar bloqueos SMTP
     // Si tenemos una API Key de Resend (empieza con re_) y no hay configuración SMTP custom en DB
-    if (process.env.SMTP_PASS && process.env.SMTP_PASS.startsWith('re_') && (!settings || !settings.smtp)) {
+    if (!forceSmtp && process.env.SMTP_PASS && process.env.SMTP_PASS.startsWith('re_') && (!settings || !settings.smtp)) {
       console.log('🚀 Usando Resend API (HTTP) para evitar timeouts SMTP...');
       try {
         const resendResp = await fetch('https://api.resend.com/emails', {
@@ -355,7 +383,8 @@ async function sendEmail(to, subject, text, html) {
       to,
       subject,
       text,
-      html
+      html,
+      attachments
     });
 
     console.log('Message sent: %s', info.messageId);
@@ -380,6 +409,102 @@ async function sendEmail(to, subject, text, html) {
   }
 }
 
+function parseEmailList(value) {
+  return String(value || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function formatDateYYYYMMDD(date) {
+  const d = new Date(date);
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+async function buildAuditXlsxBuffer(logs, { from, to, truncated, rolesById, rolesByEmail } = {}) {
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = 'MegaRifas';
+  workbook.created = new Date();
+
+  function normalizeRole(role) {
+    const r = String(role || '').trim().toLowerCase();
+    if (r === 'admin' || r === 'superadmin' || r === 'user') return r;
+    return r || 'unknown';
+  }
+
+  function getActorRole(log) {
+    try {
+      if (log && log.userId != null && rolesById && typeof rolesById.get === 'function') {
+        const r = rolesById.get(log.userId);
+        if (r) return normalizeRole(r);
+      }
+      if (log && log.userEmail && rolesByEmail && typeof rolesByEmail.get === 'function') {
+        const r = rolesByEmail.get(String(log.userEmail).toLowerCase());
+        if (r) return normalizeRole(r);
+      }
+      if (log && log.userEmail && String(log.userEmail).toLowerCase() === String(SUPERADMIN_EMAIL).toLowerCase()) {
+        return 'superadmin';
+      }
+    } catch (_e) {
+      // ignore
+    }
+    return 'unknown';
+  }
+
+  function initSheet(name) {
+    const sheet = workbook.addWorksheet(name);
+    sheet.columns = [
+      { header: 'Timestamp', key: 'timestamp', width: 22 },
+      { header: 'Severity', key: 'severity', width: 10 },
+      { header: 'Action', key: 'action', width: 26 },
+      { header: 'ActorRole', key: 'actorRole', width: 12 },
+      { header: 'UserId', key: 'userId', width: 10 },
+      { header: 'UserEmail', key: 'userEmail', width: 28 },
+      { header: 'Entity', key: 'entity', width: 14 },
+      { header: 'EntityId', key: 'entityId', width: 16 },
+      { header: 'IP', key: 'ipAddress', width: 16 },
+      { header: 'UserAgent', key: 'userAgent', width: 40 },
+      { header: 'Detail', key: 'detail', width: 60 }
+    ];
+
+    if (from && to) {
+      sheet.addRow({ timestamp: `Rango: ${new Date(from).toISOString()} → ${new Date(to).toISOString()}` });
+      sheet.addRow({ timestamp: `Truncado: ${truncated ? 'SI' : 'NO'}` });
+      sheet.addRow({});
+    }
+    return sheet;
+  }
+
+  const adminsSheet = initSheet('Admins');
+  const usersSheet = initSheet('Usuarios');
+
+  for (const log of Array.isArray(logs) ? logs : []) {
+    const actorRole = getActorRole(log);
+    const row = {
+      timestamp: log.timestamp ? new Date(log.timestamp).toISOString() : '',
+      severity: log.severity || '',
+      action: log.action || '',
+      actorRole,
+      userId: log.userId ?? '',
+      userEmail: log.userEmail || '',
+      entity: log.entity || '',
+      entityId: log.entityId || '',
+      ipAddress: log.ipAddress || '',
+      userAgent: log.userAgent || '',
+      detail: log.detail || ''
+    };
+
+    if (actorRole === 'admin' || actorRole === 'superadmin') adminsSheet.addRow(row);
+    else usersSheet.addRow(row);
+  }
+
+  const buf = await workbook.xlsx.writeBuffer();
+  return Buffer.from(buf);
+}
+
 // Helper para generar IDs cortos y legibles (ej. USR-12345678)
 function generateShortId(prefix = 'ID') {
   const random = Math.random().toString(36).substring(2, 10).toUpperCase();
@@ -399,6 +524,48 @@ function generateSecurityId() {
   result += '-';
   result += chars.charAt(Math.floor(Math.random() * chars.length));
   return result;
+}
+
+async function generateUniqueSecurityId(maxAttempts = 25) {
+  for (let i = 0; i < maxAttempts; i++) {
+    const securityId = generateSecurityId();
+    const exists = await prisma.user.findUnique({ where: { securityId } });
+    if (!exists) return securityId;
+  }
+  // Fallback muy improbable; cambia prefijo para reducir colisión.
+  for (let i = 0; i < maxAttempts; i++) {
+    const securityId = `MR-${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+    const exists = await prisma.user.findUnique({ where: { securityId } });
+    if (!exists) return securityId;
+  }
+  throw new Error('No se pudo generar un securityId único');
+}
+
+async function backfillMissingSecurityIds({ batchSize = 200 } = {}) {
+  try {
+    // Nota: se ejecuta en background al iniciar. Si la DB es grande, lo dejamos batch.
+    while (true) {
+      const users = await prisma.user.findMany({
+        where: { securityId: null },
+        select: { id: true },
+        take: batchSize
+      });
+      if (!users.length) break;
+
+      for (const u of users) {
+        try {
+          const securityId = await generateUniqueSecurityId();
+          await prisma.user.update({ where: { id: u.id }, data: { securityId } });
+        } catch (e) {
+          console.warn('[SECURITY_ID] Backfill failed for user', u.id, e?.message || e);
+        }
+      }
+
+      if (users.length < batchSize) break;
+    }
+  } catch (e) {
+    console.warn('[SECURITY_ID] Backfill skipped:', e?.message || e);
+  }
 }
 
 // Reintentos para conexión a DB al iniciar
@@ -424,13 +591,15 @@ async function ensureSuperAdmin() {
     const existing = await prisma.user.findUnique({ where: { email: SUPERADMIN_EMAIL } });
     if (!existing) {
       const hashed = await bcrypt.hash(SUPERADMIN_PASSWORD, 10);
+      const securityId = await generateUniqueSecurityId();
       await prisma.user.create({
         data: {
           email: SUPERADMIN_EMAIL,
           password: hashed,
           name: 'Super Admin',
           role: SUPERADMIN_ROLE,
-          publicId: generateShortId('ADM')
+          publicId: generateShortId('ADM'),
+          securityId
         }
       });
       console.log('Superadmin creado automáticamente');
@@ -442,6 +611,12 @@ async function ensureSuperAdmin() {
           data: { role: SUPERADMIN_ROLE }
         });
         console.log('Rol de superadmin actualizado');
+      }
+
+      // Asegurar Security ID único
+      if (!existing.securityId) {
+        const securityId = await generateUniqueSecurityId();
+        await prisma.user.update({ where: { email: SUPERADMIN_EMAIL }, data: { securityId } });
       }
       console.log('Superadmin ya existe');
     }
@@ -484,6 +659,7 @@ process.on('uncaughtException', (err) => {
 // Ejecutar verificación de superadmin al iniciar
 ensureSuperAdmin().catch(err => console.error('ensureSuperAdmin error:', err));
 ensureDbColumns().catch(err => console.error('ensureDbColumns error:', err));
+backfillMissingSecurityIds().catch(err => console.error('backfillMissingSecurityIds error:', err));
 
 // Endpoint de salud
 app.get('/health', async (req, res) => {
@@ -515,6 +691,101 @@ app.get('/users', async (req, res) => {
     res.json(decryptedUsers);
   } catch (error) {
     res.status(500).json({ error: 'Error al obtener usuarios' });
+  }
+});
+
+// Perfil público del rifero (vista previa). Requiere autenticación, pero disponible para user/admin/superadmin.
+app.get('/users/public/:id', authenticateToken, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'ID inválido' });
+
+    const user = await prisma.user.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        publicId: true,
+        name: true,
+        avatar: true,
+        bio: true,
+        socials: true,
+        role: true,
+        securityId: true,
+        identityVerified: true,
+        reputationScore: true,
+        createdAt: true
+      }
+    });
+
+    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+    const rafflesCount = await prisma.raffle.count({ where: { userId: id } });
+    const salesCount = await prisma.ticket.count({ where: { raffle: { userId: id } } });
+    const prizesCount = await prisma.winner.count({ where: { raffle: { userId: id } } });
+
+    const out = {
+      ...user,
+      name: user.name ? decrypt(user.name) : user.name,
+      stats: { raffles: rafflesCount, sales: salesCount, prizes: prizesCount }
+    };
+    res.json(out);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al cargar perfil' });
+  }
+});
+
+app.get('/users/public/:id/raffles', authenticateToken, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'ID inválido' });
+
+    const active = await prisma.raffle.findMany({
+      where: { userId: id, status: 'active' },
+      select: { id: true, title: true, prize: true, totalTickets: true, createdAt: true, style: true, status: true },
+      orderBy: { createdAt: 'desc' },
+      take: 10
+    });
+
+    const closed = await prisma.raffle.findMany({
+      where: { userId: id, status: { not: 'active' } },
+      select: { id: true, title: true, prize: true, totalTickets: true, createdAt: true, style: true, status: true },
+      orderBy: { createdAt: 'desc' },
+      take: 10
+    });
+
+    const allIds = [...active.map(r => r.id), ...closed.map(r => r.id)];
+    const counts = allIds.length
+      ? await prisma.ticket.groupBy({
+          by: ['raffleId'],
+          where: { raffleId: { in: allIds } },
+          _count: { _all: true }
+        })
+      : [];
+    const soldByRaffleId = new Map(counts.map(c => [c.raffleId, c._count._all]));
+
+    const mapRaffle = (r) => {
+      const sold = soldByRaffleId.get(r.id) || 0;
+      const total = Number(r.totalTickets) || 0;
+      const remaining = total ? Math.max(total - sold, 0) : 0;
+      return {
+        id: r.id,
+        title: r.title,
+        description: r.prize || '',
+        totalTickets: r.totalTickets,
+        status: r.status,
+        style: r.style,
+        stats: { sold, remaining, total }
+      };
+    };
+
+    res.json({
+      active: active.map(mapRaffle),
+      closed: closed.map(mapRaffle)
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al cargar rifas del rifero' });
   }
 });
 
@@ -766,6 +1037,17 @@ const handleLogin = async (req, res) => {
   }
   const user = await prisma.user.findUnique({ where: { email } });
   if (!user) return res.status(401).json({ error: 'Usuario no encontrado' });
+
+  // Asegurar ID identificativo (securityId) único para confianza
+  if (!user.securityId) {
+    try {
+      const securityId = await generateUniqueSecurityId();
+      await prisma.user.update({ where: { id: user.id }, data: { securityId } });
+      user.securityId = securityId;
+    } catch (e) {
+      console.warn('[LOGIN] No se pudo asignar securityId:', e?.message || e);
+    }
+  }
 
   // 1. Verificar si la cuenta está activa
   if (!user.verified) {
@@ -1046,6 +1328,61 @@ app.delete('/raffles/:id', authenticateToken, authorizeRole(['admin', 'superadmi
     res.json({ message: 'Rifa eliminada' });
   } catch (error) {
     res.status(500).json({ error: 'Error al eliminar rifa' });
+  }
+});
+
+// Detalles de pago por rifa (métodos elegidos por el rifero + datos bancarios del vendedor)
+app.get('/raffles/:id/payment-details', authenticateToken, async (req, res) => {
+  const raffleId = Number(req.params.id);
+  if (!raffleId) return res.status(400).json({ error: 'ID inválido' });
+
+  try {
+    const raffle = await prisma.raffle.findUnique({
+      where: { id: raffleId },
+      select: {
+        id: true,
+        title: true,
+        style: true,
+        user: {
+          select: {
+            id: true,
+            publicId: true,
+            name: true,
+            email: true,
+            avatar: true,
+            securityId: true,
+            identityVerified: true,
+            bankDetails: true
+          }
+        }
+      }
+    });
+
+    if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
+
+    const style = raffle.style && typeof raffle.style === 'object' ? raffle.style : {};
+    const paymentMethods = normalizePaymentMethods(style.paymentMethods);
+    const seller = raffle.user || null;
+
+    return res.json({
+      raffle: { id: raffle.id, title: raffle.title },
+      paymentMethods,
+      bankDetails: seller?.bankDetails || null,
+      seller: seller
+        ? {
+            id: seller.id,
+            publicId: seller.publicId,
+            name: seller.name ? safeDecrypt(seller.name) : null,
+            email: seller.email,
+            avatar: seller.avatar,
+            identityVerified: !!seller.identityVerified,
+            securityIdLast8: seller.securityId ? String(seller.securityId).slice(-8).toUpperCase() : null
+          }
+        : null
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al obtener detalles de pago' });
   }
 });
 
@@ -1598,46 +1935,199 @@ app.get('/verify-ticket/:serial', async (req, res) => {
 });
 
 // Verificador (Admin) con datos del comprador
-app.get('/admin/verify-ticket/:serial', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
-  const { serial } = req.params;
-  const safeSerial = String(serial || '').trim();
-  if (!safeSerial) return res.status(400).json({ valid: false, error: 'Serial requerido' });
+app.get('/admin/verify-ticket/:query', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  const queryRaw = String(req.params.query || '').trim();
+  if (!queryRaw) return res.status(400).json({ valid: false, error: 'Consulta requerida' });
 
   try {
-    const ticket = await prisma.ticket.findUnique({
-      where: { serialNumber: safeSerial },
-      include: {
-        user: { select: { id: true, publicId: true, name: true, email: true, phone: true, cedula: true } },
-        raffle: { select: { id: true, title: true } }
+    const actorRole = String(req.user?.role || '').toLowerCase();
+    const actorId = req.user?.userId;
+
+    const scopeWhere = actorRole === 'superadmin' ? {} : { raffle: { userId: actorId } };
+    const take = Math.min(Math.max(Number(req.query.take) || 50, 1), 200);
+    const pageSize = Math.min(200, Math.max(50, take));
+    const maxScan = 5000;
+
+    const include = {
+      user: { select: { id: true, publicId: true, name: true, email: true, phone: true, cedula: true } },
+      raffle: {
+        select: {
+          id: true,
+          title: true,
+          user: { select: { id: true, publicId: true, name: true, email: true, avatar: true, securityId: true } }
+        }
       }
-    });
-
-    if (!ticket) return res.status(404).json({ valid: false, error: 'Ticket no encontrado' });
-
-    const buyer = ticket.user || {};
-    const buyerSafe = {
-      id: buyer.id,
-      publicId: buyer.publicId,
-      email: buyer.email,
-      name: buyer.name ? decrypt(buyer.name) : null,
-      phone: buyer.phone ? decrypt(buyer.phone) : null,
-      cedula: buyer.cedula ? decrypt(buyer.cedula) : null
     };
 
-    res.json({
-      valid: true,
-      ticket: {
+    const isNumeric = /^\d+$/.test(queryRaw);
+    const qLower = queryRaw.toLowerCase();
+    const looksLikeEmail = qLower.includes('@');
+
+    let candidates = [];
+
+    // 1) Intento exacto por serial (uuid)
+    const bySerial = await prisma.ticket.findFirst({
+      where: { ...scopeWhere, serialNumber: queryRaw },
+      include
+    });
+    if (bySerial) {
+      candidates = [bySerial];
+    } else if (isNumeric) {
+      // 2) Búsqueda por número (puede tener múltiples coincidencias en muchas rifas)
+      candidates = await prisma.ticket.findMany({
+        where: { ...scopeWhere, number: Number(queryRaw) },
+        include,
+        orderBy: { createdAt: 'desc' },
+        take
+      });
+    } else {
+      // 3) Búsqueda por texto (email se filtra en DB; nombre/cédula/teléfono se filtra en memoria)
+      if (looksLikeEmail) {
+        candidates = await prisma.ticket.findMany({
+          where: { ...scopeWhere, user: { email: { contains: queryRaw, mode: 'insensitive' } } },
+          include,
+          orderBy: { createdAt: 'desc' },
+          take
+        });
+      } else {
+        // Escaneo paginado para poder encontrar coincidencias en campos encriptados sin fallar con muchas rifas
+        let skip = 0;
+        let scanned = 0;
+        const matches = [];
+
+        while (matches.length < take && scanned < maxScan) {
+          const page = await prisma.ticket.findMany({
+            where: scopeWhere,
+            include,
+            orderBy: { createdAt: 'desc' },
+            skip,
+            take: pageSize
+          });
+
+          if (!page.length) break;
+          scanned += page.length;
+          skip += page.length;
+
+          const mappedPage = page.map((ticket) => {
+            const buyer = ticket.user || {};
+            const seller = ticket.raffle?.user || {};
+
+            const buyerName = buyer.name ? safeDecrypt(buyer.name) : null;
+            const buyerPhone = buyer.phone ? safeDecrypt(buyer.phone) : null;
+            const buyerCedula = buyer.cedula ? safeDecrypt(buyer.cedula) : null;
+            const sellerName = seller.name ? safeDecrypt(seller.name) : null;
+
+            return {
+              id: ticket.id,
+              serialNumber: ticket.serialNumber,
+              number: ticket.number,
+              status: ticket.status,
+              createdAt: ticket.createdAt,
+              raffle: { id: ticket.raffle?.id, title: ticket.raffle?.title },
+              seller: {
+                id: seller.id,
+                publicId: seller.publicId,
+                name: sellerName,
+                email: seller.email,
+                avatar: seller.avatar,
+                securityIdLast8: seller.securityId ? String(seller.securityId).slice(-8).toUpperCase() : null
+              },
+              buyer: {
+                id: buyer.id,
+                publicId: buyer.publicId,
+                name: buyerName,
+                email: buyer.email,
+                phone: buyerPhone,
+                cedula: buyerCedula
+              },
+              signature: ticket.receiptSignature
+            };
+          });
+
+          const filteredPage = mappedPage.filter((m) => {
+            const haystack = [
+              m.serialNumber,
+              String(m.number ?? ''),
+              m.buyer?.name,
+              m.buyer?.email,
+              m.buyer?.phone,
+              m.buyer?.cedula
+            ]
+              .filter((x) => x != null)
+              .map((x) => String(x).toLowerCase());
+            return haystack.some((s) => s.includes(qLower));
+          });
+
+          for (const m of filteredPage) {
+            matches.push(m);
+            if (matches.length >= take) break;
+          }
+        }
+
+        // Ya devolvemos resultados mapeados arriba
+        if (matches.length) {
+          return res.json({ valid: true, matches, count: matches.length, verifiedAt: new Date() });
+        }
+
+        candidates = [];
+      }
+    }
+
+    const mapped = (Array.isArray(candidates) ? candidates : []).map((ticket) => {
+      const buyer = ticket.user || {};
+      const seller = ticket.raffle?.user || {};
+
+      const buyerName = buyer.name ? safeDecrypt(buyer.name) : null;
+      const buyerPhone = buyer.phone ? safeDecrypt(buyer.phone) : null;
+      const buyerCedula = buyer.cedula ? safeDecrypt(buyer.cedula) : null;
+      const sellerName = seller.name ? safeDecrypt(seller.name) : null;
+
+      return {
         id: ticket.id,
         serialNumber: ticket.serialNumber,
         number: ticket.number,
         status: ticket.status,
         createdAt: ticket.createdAt,
-        raffle: ticket.raffle,
-        buyer: buyerSafe,
-        signature: ticket.receiptSignature,
-        verifiedAt: new Date()
-      }
+        raffle: { id: ticket.raffle?.id, title: ticket.raffle?.title },
+        seller: {
+          id: seller.id,
+          publicId: seller.publicId,
+          name: sellerName,
+          email: seller.email,
+          avatar: seller.avatar,
+          securityIdLast8: seller.securityId ? String(seller.securityId).slice(-8).toUpperCase() : null
+        },
+        buyer: {
+          id: buyer.id,
+          publicId: buyer.publicId,
+          name: buyerName,
+          email: buyer.email,
+          phone: buyerPhone,
+          cedula: buyerCedula
+        },
+        signature: ticket.receiptSignature
+      };
     });
+
+    // Filtrado extra para consultas por nombre/cédula/teléfono (en memoria)
+    const filtered = mapped.filter((m) => {
+      if (isNumeric || looksLikeEmail) return true;
+      const haystack = [
+        m.serialNumber,
+        String(m.number ?? ''),
+        m.buyer?.name,
+        m.buyer?.email,
+        m.buyer?.phone,
+        m.buyer?.cedula
+      ]
+        .filter((x) => x != null)
+        .map((x) => String(x).toLowerCase());
+
+      return haystack.some((s) => s.includes(qLower));
+    });
+
+    if (!filtered.length) return res.status(404).json({ valid: false, error: 'Sin coincidencias' });
+    return res.json({ valid: true, matches: filtered, count: filtered.length, verifiedAt: new Date() });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Error de verificación' });
@@ -1778,57 +2268,154 @@ app.patch('/admin/raffles/:id', authenticateToken, authorizeRole(['admin', 'supe
 
 app.get('/admin/tickets', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
   try {
-    const { raffleId, status, from, to, email, phone, cedula } = req.query;
-    const where = {};
+    const actorRole = String(req.user?.role || '').toLowerCase();
+    const actorId = req.user?.userId;
+
+    const { raffleId, status, from, to, email, phone, cedula, number, serial, q, take } = req.query;
+
+    const baseWhere = actorRole === 'superadmin' ? {} : { raffle: { userId: actorId } };
+    const where = { ...baseWhere };
     if (raffleId) where.raffleId = Number(raffleId);
     if (status) where.status = status;
+    if (number) where.number = Number(number);
+    if (serial) where.serialNumber = String(serial).trim();
     if (from || to) {
       where.createdAt = {};
       if (from) where.createdAt.gte = new Date(from);
       if (to) where.createdAt.lte = new Date(to);
     }
 
-    const tickets = await prisma.ticket.findMany({
-      where,
-      include: {
-        user: { select: { email: true, name: true, phone: true, cedula: true } },
-        raffle: { select: { title: true } }
-      },
-      orderBy: { createdAt: 'desc' },
-      take: 1000
-    });
+    const takeN = Math.min(Math.max(Number(take) || 500, 1), 1000);
+    const offsetN = Math.max(Number(req.query.offset) || 0, 0);
+    const pageSize = Math.min(200, Math.max(50, Math.min(takeN, 200)));
+    const maxScan = 5000;
 
-    let normalized = (Array.isArray(tickets) ? tickets : []).map((t) => {
-      const u = t.user || {};
-      const user = {
-        ...u,
-        name: u.name ? decrypt(u.name) : u.name,
-        phone: u.phone ? decrypt(u.phone) : u.phone,
-        cedula: u.cedula ? decrypt(u.cedula) : u.cedula
-      };
-      return {
-        ...t,
-        user,
-        raffleTitle: t.raffle?.title
-      };
-    });
+    const qRaw = String(q || '').trim();
+    const qLower = qRaw.toLowerCase();
+    const looksLikeEmail = qLower.includes('@');
+    const isNumeric = /^\d+$/.test(qRaw);
 
-    // Filtros por datos del comprador (teléfono/cédula están encriptados en DB)
     const emailQ = String(email || '').trim().toLowerCase();
     const phoneQ = String(phone || '').trim();
     const cedulaQ = String(cedula || '').trim();
 
+    // Email no está encriptado: filtrar desde DB para reducir carga
     if (emailQ) {
-      normalized = normalized.filter((t) => String(t.user?.email || '').toLowerCase().includes(emailQ));
-    }
-    if (phoneQ) {
-      normalized = normalized.filter((t) => String(t.user?.phone || '').includes(phoneQ));
-    }
-    if (cedulaQ) {
-      normalized = normalized.filter((t) => String(t.user?.cedula || '').includes(cedulaQ));
+      where.user = { email: { contains: emailQ, mode: 'insensitive' } };
     }
 
-    res.json(normalized);
+    // q: si es email o número, se filtra en DB; si es texto (nombre/cédula/teléfono), se filtra en memoria con escaneo paginado
+    const needsScanByEncrypted = !!phoneQ || !!cedulaQ || (qRaw && !looksLikeEmail && !isNumeric);
+
+    if (qRaw && !needsScanByEncrypted) {
+      if (looksLikeEmail) {
+        where.user = { email: { contains: qRaw, mode: 'insensitive' } };
+      } else if (isNumeric) {
+        where.number = Number(qRaw);
+      } else {
+        // fallback: serial parcial
+        where.serialNumber = { contains: qRaw };
+      }
+    }
+
+    const include = {
+      user: { select: { id: true, publicId: true, email: true, name: true, phone: true, cedula: true } },
+      raffle: {
+        select: {
+          id: true,
+          title: true,
+          user: { select: { id: true, publicId: true, name: true, email: true, avatar: true, securityId: true } }
+        }
+      }
+    };
+
+    const mapTicket = (t) => {
+      const u = t.user || {};
+      const seller = t.raffle?.user || {};
+      const user = {
+        ...u,
+        name: u.name ? safeDecrypt(u.name) : u.name,
+        phone: u.phone ? safeDecrypt(u.phone) : u.phone,
+        cedula: u.cedula ? safeDecrypt(u.cedula) : u.cedula
+      };
+      return {
+        ...t,
+        user,
+        raffleTitle: t.raffle?.title,
+        seller: {
+          id: seller.id,
+          publicId: seller.publicId,
+          name: seller.name ? safeDecrypt(seller.name) : null,
+          email: seller.email,
+          avatar: seller.avatar,
+          securityIdLast8: seller.securityId ? String(seller.securityId).slice(-8).toUpperCase() : null
+        }
+      };
+    };
+
+    const filterInMemory = (rows) => {
+      let out = rows;
+
+      if (phoneQ) out = out.filter((t) => String(t.user?.phone || '').includes(phoneQ));
+      if (cedulaQ) out = out.filter((t) => String(t.user?.cedula || '').includes(cedulaQ));
+
+      if (qRaw && needsScanByEncrypted) {
+        out = out.filter((t) => {
+          const haystack = [
+            t.serialNumber,
+            String(t.number ?? ''),
+            t.user?.name,
+            t.user?.email,
+            t.user?.phone,
+            t.user?.cedula
+          ]
+            .filter((x) => x != null)
+            .map((x) => String(x).toLowerCase());
+          return haystack.some((s) => s.includes(qLower));
+        });
+      }
+      return out;
+    };
+
+    if (!needsScanByEncrypted) {
+      const tickets = await prisma.ticket.findMany({
+        where,
+        include,
+        orderBy: { createdAt: 'desc' },
+        skip: offsetN,
+        take: takeN
+      });
+      const normalized = tickets.map(mapTicket);
+      return res.json(normalized);
+    }
+
+    // Escaneo paginado para soportar búsqueda por campos encriptados sin fallar con datasets grandes
+    let skip = offsetN;
+    let scanned = 0;
+    const results = [];
+    while (results.length < takeN && scanned < maxScan) {
+      const page = await prisma.ticket.findMany({
+        where: { ...where, OR: undefined },
+        include,
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: pageSize
+      });
+
+      if (!page.length) break;
+      scanned += page.length;
+      skip += page.length;
+
+      const mappedPage = page.map(mapTicket);
+      const filteredPage = filterInMemory(mappedPage);
+
+      for (const row of filteredPage) {
+        results.push(row);
+        if (results.length >= takeN) break;
+      }
+    }
+
+    return res.json(results);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Error al buscar tickets' });
@@ -2823,6 +3410,133 @@ cron.schedule('0 22 * * *', async () => {
   scheduled: true,
   timezone: "America/Caracas" // Adjust as needed
 });
+
+// Cron Job: Daily Audit Report (XLSX)
+async function sendDailyAuditReport() {
+  const enabled = String(process.env.AUDIT_REPORT_ENABLED || '').toLowerCase() === 'true';
+  if (!enabled) return;
+
+  const maxRows = Math.min(Math.max(Number(process.env.AUDIT_REPORT_MAX_ROWS) || 5000, 100), 50000);
+
+  const recipients = parseEmailList(process.env.AUDIT_REPORT_EMAILS || SUPERADMIN_EMAIL);
+  if (!recipients.length) {
+    console.warn('[CRON] AUDIT_REPORT_EMAILS not set; skipping audit report.');
+    return;
+  }
+
+  const now = new Date();
+  const to = now;
+  const from = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
+  try {
+    const logs = await prisma.auditLog.findMany({
+      where: { timestamp: { gte: from, lt: to } },
+      orderBy: { timestamp: 'asc' },
+      take: maxRows
+    });
+
+    // Resolver roles reales desde User para separar Admins vs Usuarios
+    const rolesById = new Map();
+    const rolesByEmail = new Map();
+    try {
+      const userIds = Array.from(
+        new Set(
+          (Array.isArray(logs) ? logs : [])
+            .map((l) => l?.userId)
+            .filter((id) => typeof id === 'number' && Number.isFinite(id))
+        )
+      );
+
+      if (userIds.length) {
+        const users = await prisma.user.findMany({
+          where: { id: { in: userIds } },
+          select: { id: true, email: true, role: true }
+        });
+        for (const u of users) {
+          if (u && typeof u.id === 'number') rolesById.set(u.id, u.role);
+          if (u && u.email) rolesByEmail.set(String(u.email).toLowerCase(), u.role);
+        }
+      }
+
+      const missingEmails = Array.from(
+        new Set(
+          (Array.isArray(logs) ? logs : [])
+            .filter((l) => l?.userId == null)
+            .map((l) => String(l?.userEmail || '').toLowerCase())
+            .filter(Boolean)
+        )
+      ).slice(0, 2000);
+
+      if (missingEmails.length) {
+        const usersByEmail = await prisma.user.findMany({
+          where: { email: { in: missingEmails } },
+          select: { email: true, role: true, id: true }
+        });
+        for (const u of usersByEmail) {
+          if (u && u.email) rolesByEmail.set(String(u.email).toLowerCase(), u.role);
+          if (u && typeof u.id === 'number') rolesById.set(u.id, u.role);
+        }
+      }
+    } catch (e) {
+      console.warn('[CRON] Could not resolve user roles for audit report:', e?.message || e);
+    }
+
+    const truncated = Array.isArray(logs) && logs.length >= maxRows;
+    const dateLabel = formatDateYYYYMMDD(to);
+    const filename = `audit_${dateLabel}.xlsx`;
+    const attachment = await buildAuditXlsxBuffer(logs, { from, to, truncated, rolesById, rolesByEmail });
+
+    const subject = `Reporte diario de auditoría (${dateLabel})`;
+    const text = `Reporte diario de auditoría.\nRango: ${from.toISOString()} → ${to.toISOString()}\nRegistros: ${logs.length}${truncated ? ' (TRUNCADO por límite)' : ''}\n`;
+    const html = `<h1>Reporte diario de auditoría</h1><p><b>Rango:</b> ${from.toISOString()} → ${to.toISOString()}</p><p><b>Registros:</b> ${logs.length}${truncated ? ' <b>(TRUNCADO por límite)</b>' : ''}</p><p>Adjunto: <b>${filename}</b></p>`;
+
+    const ok = await sendEmail(
+      recipients.join(','),
+      subject,
+      text,
+      html,
+      { forceSmtp: true, attachments: [{ filename, content: attachment }] }
+    );
+
+    await prisma.auditLog.create({
+      data: {
+        action: ok ? 'AUDIT_REPORT_SENT' : 'AUDIT_REPORT_FAILED',
+        entity: 'AuditLog',
+        userEmail: recipients[0] || null,
+        detail: `Daily audit report ${ok ? 'sent' : 'failed'} to ${recipients.join(', ')}. Rows: ${logs.length}${truncated ? ' (truncated)' : ''}.`,
+        severity: ok ? 'INFO' : 'ERROR',
+        metadata: { recipients, from: from.toISOString(), to: to.toISOString(), rows: logs.length, truncated }
+      }
+    });
+  } catch (error) {
+    console.error('[CRON] Daily audit report failed:', error);
+    try {
+      await prisma.auditLog.create({
+        data: {
+          action: 'AUDIT_REPORT_FAILED',
+          entity: 'AuditLog',
+          detail: `Daily audit report failed: ${String(error?.message || error)}`,
+          severity: 'ERROR'
+        }
+      });
+    } catch (_e) {
+      // ignore
+    }
+  }
+}
+
+const AUDIT_REPORT_CRON = process.env.AUDIT_REPORT_CRON || '0 1 * * *';
+cron.schedule(
+  AUDIT_REPORT_CRON,
+  async () => {
+    console.log('[CRON] Sending daily audit report...');
+    await sendDailyAuditReport();
+  },
+  {
+    scheduled: true,
+    timezone: process.env.AUDIT_REPORT_TIMEZONE || 'America/Caracas'
+  }
+);
 
 // --- WINNERS ---
 app.get('/winners', async (req, res) => {
