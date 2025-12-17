@@ -45,6 +45,17 @@ El backend incluye un script:
 
 - `npm run seed:superadmin`
 
+## 5.1) Reset (dejar solo superadmin)
+
+⚠️ **PELIGRO**: esto borra datos (rifas, tickets, transacciones, logs, usuarios) y deja únicamente el usuario `superadmin`.
+
+- Comando:
+	- `npm run reset:to-superadmin -- --yes`
+- Para apuntar a otra base de datos, pasa el `DATABASE_URL` como primer argumento:
+	- `npm run reset:to-superadmin -- "postgresql://..." --yes`
+
+Recomendación: haz un backup antes (especialmente si es producción).
+
 Puedes correrlo desde:
 
 - Render → tu servicio → **Shell**
