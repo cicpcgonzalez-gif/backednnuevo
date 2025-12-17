@@ -77,6 +77,26 @@ async function ensureSuperadmin(prisma) {
   }
 }
 
+async function safeDeleteMany(prisma, modelKey, args = {}) {
+  const client = prisma?.[modelKey];
+  if (!client || typeof client.deleteMany !== 'function') {
+    console.warn(`[RESET] Modelo Prisma no encontrado: ${modelKey} (omitido)`);
+    return { count: 0, skipped: true };
+  }
+  return client.deleteMany(args);
+}
+
+async function safeDeleteManyAny(prisma, modelKeys, args = {}) {
+  for (const key of Array.isArray(modelKeys) ? modelKeys : []) {
+    const client = prisma?.[key];
+    if (client && typeof client.deleteMany === 'function') {
+      return safeDeleteMany(prisma, key, args);
+    }
+  }
+  console.warn(`[RESET] Ningún modelo Prisma válido encontrado para: ${modelKeys.join(', ')} (omitido)`);
+  return { count: 0, skipped: true };
+}
+
 async function resetToSuperadmin() {
   const argv = process.argv.slice(2);
   const firstArg = argv[0];
@@ -110,43 +130,34 @@ async function resetToSuperadmin() {
     console.log('Borrando datos (excepto superadmin)...');
 
     // Orden importante por llaves foráneas
-    await prisma.reaction.deleteMany({});
-    await prisma.announcement.deleteMany({});
+    await safeDeleteMany(prisma, 'reaction');
+    await safeDeleteMany(prisma, 'announcement');
 
-    await prisma.ticket.deleteMany({});
-    await prisma.winner.deleteMany({});
-    await prisma.transaction.deleteMany({});
+    await safeDeleteMany(prisma, 'ticket');
+    await safeDeleteMany(prisma, 'winner');
+    await safeDeleteMany(prisma, 'transaction');
 
-    await prisma.kycRequest.deleteMany({});
-    await prisma.suspiciousActivity.deleteMany({});
+    // Prisma client usa lowerCamelCase basado en el nombre del modelo.
+    // Para KYCRequest típicamente es `kYCRequest`.
+    await safeDeleteManyAny(prisma, ['kYCRequest', 'kycRequest']);
+    await safeDeleteMany(prisma, 'suspiciousActivity');
 
-    await prisma.raffle.deleteMany({});
+    await safeDeleteMany(prisma, 'raffle');
 
-    await prisma.auditLog.deleteMany({});
-    await prisma.mailLog.deleteMany({});
-    await prisma.blacklist.deleteMany({});
+    await safeDeleteMany(prisma, 'auditLog');
+    await safeDeleteMany(prisma, 'mailLog');
+    await safeDeleteMany(prisma, 'blacklist');
 
-    // Dejar settings "limpio" (pero existente) para evitar null issues
-    await prisma.systemSettings.upsert({
-      where: { id: 1 },
-      update: {
-        branding: null,
-        modules: null,
-        smtp: null,
-        company: null,
-        securityCode: null,
-        techSupport: null
-      },
-      create: {
-        id: 1,
-        branding: null,
-        modules: null,
-        smtp: null,
-        company: null,
-        securityCode: null,
-        techSupport: null
-      }
-    });
+    // Asegurar que exista SystemSettings (id=1). No forzamos null en Json porque Prisma usa JsonNull/DbNull.
+    try {
+      await prisma.systemSettings.upsert({
+        where: { id: 1 },
+        update: {},
+        create: { id: 1 }
+      });
+    } catch (e) {
+      console.warn('[RESET] No se pudo asegurar SystemSettings:', e?.message || e);
+    }
 
     const deletedUsers = await prisma.user.deleteMany({
       where: {
