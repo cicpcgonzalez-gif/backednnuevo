@@ -98,18 +98,40 @@ async function ensureDbColumns() {
   // En MySQL/MariaDB el esquema se maneja con migraciones de Prisma.
   // Las sentencias de este helper son específicas de Postgres y solo generan ruido/errores.
   if (databaseUrl.startsWith('mysql://')) return;
+
+  function isIgnorablePgDuplicate(e) {
+    // Prisma wraps raw SQL errors as P2010 with a driver-specific meta.code.
+    const prismaCode = e?.code;
+    const driverCode = e?.meta?.code;
+    // 23505: unique_violation (e.g. pg_class relname already exists)
+    // 42P07: duplicate_table
+    // 42710: duplicate_object
+    if (prismaCode === 'P2010' && ['23505', '42P07', '42710'].includes(String(driverCode))) return true;
+    const message = String(e?.meta?.message || e?.message || '');
+    return /already exists/i.test(message);
+  }
+
+  async function execIgnoreDuplicate(sql) {
+    try {
+      await prisma.$executeRawUnsafe(sql);
+    } catch (e) {
+      if (isIgnorablePgDuplicate(e)) return;
+      throw e;
+    }
+  }
+
   try {
-    await prisma.$executeRawUnsafe('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "adminPlan" JSONB;');
+    await execIgnoreDuplicate('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "adminPlan" JSONB;');
 
-    await prisma.$executeRawUnsafe('ALTER TABLE "Raffle" ADD COLUMN IF NOT EXISTS "status" TEXT NOT NULL DEFAULT \'active\';');
-    await prisma.$executeRawUnsafe('ALTER TABLE "Raffle" ADD COLUMN IF NOT EXISTS "activatedAt" TIMESTAMP;');
-    await prisma.$executeRawUnsafe('ALTER TABLE "Raffle" ADD COLUMN IF NOT EXISTS "closedAt" TIMESTAMP;');
+    await execIgnoreDuplicate('ALTER TABLE "Raffle" ADD COLUMN IF NOT EXISTS "status" TEXT NOT NULL DEFAULT \'active\';');
+    await execIgnoreDuplicate('ALTER TABLE "Raffle" ADD COLUMN IF NOT EXISTS "activatedAt" TIMESTAMP;');
+    await execIgnoreDuplicate('ALTER TABLE "Raffle" ADD COLUMN IF NOT EXISTS "closedAt" TIMESTAMP;');
 
-    await prisma.$executeRawUnsafe('UPDATE "Raffle" SET "status"=\'active\' WHERE "status" IS NULL;');
-    await prisma.$executeRawUnsafe('UPDATE "Raffle" SET "activatedAt"="createdAt" WHERE "activatedAt" IS NULL AND "status"=\'active\';');
+    await execIgnoreDuplicate('UPDATE "Raffle" SET "status"=\'active\' WHERE "status" IS NULL;');
+    await execIgnoreDuplicate('UPDATE "Raffle" SET "activatedAt"="createdAt" WHERE "activatedAt" IS NULL AND "status"=\'active\';');
 
     // Reacciones de rifas (LIKE/HEART)
-    await prisma.$executeRawUnsafe(`
+    await execIgnoreDuplicate(`
       CREATE TABLE IF NOT EXISTS "RaffleReaction" (
         "id" SERIAL PRIMARY KEY,
         "type" TEXT NOT NULL,
@@ -121,8 +143,8 @@ async function ensureDbColumns() {
         CONSTRAINT "RaffleReaction_raffle_fkey" FOREIGN KEY ("raffleId") REFERENCES "Raffle"("id") ON DELETE CASCADE
       );
     `);
-    await prisma.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS "RaffleReaction_raffle_createdAt_idx" ON "RaffleReaction"("raffleId", "createdAt");');
-    await prisma.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS "RaffleReaction_raffle_type_idx" ON "RaffleReaction"("raffleId", "type");');
+    await execIgnoreDuplicate('CREATE INDEX IF NOT EXISTS "RaffleReaction_raffle_createdAt_idx" ON "RaffleReaction"("raffleId", "createdAt");');
+    await execIgnoreDuplicate('CREATE INDEX IF NOT EXISTS "RaffleReaction_raffle_type_idx" ON "RaffleReaction"("raffleId", "type");');
   } catch (e) {
     console.error('[DB] ensureDbColumns adminPlan failed:', e?.message || e);
   }
