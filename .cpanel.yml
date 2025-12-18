@@ -1,0 +1,7 @@
+deployment:
+  tasks:
+    # Deploy to a stable path under your cPanel account HOME.
+    # Then point your Application Manager "Application path" to this DEPLOYPATH.
+    - export DEPLOYPATH=$HOME/repositories/backednnuevo_deploy
+    - /bin/mkdir -p $DEPLOYPATH
+    - /usr/bin/rsync -a --delete --exclude ".git" --exclude "node_modules" --exclude ".env" ./ $DEPLOYPATH
