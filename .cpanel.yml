@@ -1,5 +1,12 @@
 deployment:
   tasks:
-    - export DEPLOYPATH="$HOME/repositorios/backednnuevo_deploy"
+    # Default deploy path under HOME (can be overridden if the platform sets DEPLOYPATH)
+    - export DEPLOYPATH="${DEPLOYPATH:-$HOME/backendrifas_deploy}"
     - /bin/mkdir -p "$DEPLOYPATH"
-    - /usr/bin/rsync -a --delete --exclude ".git" --exclude "node_modules" --exclude ".env" ./ "$DEPLOYPATH/"
+    # Prefer rsync if available; fallback to tar-based copy.
+    - |
+      if command -v rsync >/dev/null 2>&1; then
+        rsync -a --delete --exclude ".git" --exclude "node_modules" --exclude ".env" ./ "$DEPLOYPATH/"
+      else
+        tar -cf - --exclude=.git --exclude=node_modules --exclude=.env . | (cd "$DEPLOYPATH" && tar -xpf -)
+      fi
