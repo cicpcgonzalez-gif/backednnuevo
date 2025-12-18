@@ -1,4 +1,5 @@
 const path = require('path');
+const fs = require('fs');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 const express = require('express');
 const { PrismaClient, Prisma } = require('@prisma/client');
@@ -21,6 +22,25 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (err) => {
   console.error('[FATAL] unhandledRejection:', err);
 });
+
+function safeAppendStartupLog(message) {
+  try {
+    const dir = path.join(__dirname, 'tmp');
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch (_e) {
+      // ignore
+    }
+    const file = path.join(dir, 'startup.log');
+    fs.appendFileSync(file, `${new Date().toISOString()} ${message}\n`);
+  } catch (_e) {
+    // ignore
+  }
+}
+
+safeAppendStartupLog(
+  `BOOT pid=${process.pid} cwd=${process.cwd()} node=${process.version} env.PORT=${process.env.PORT || ''} NODE_ENV=${process.env.NODE_ENV || ''}`
+);
 
 // --- Admin Plans (subscription/quotas) ---
 
