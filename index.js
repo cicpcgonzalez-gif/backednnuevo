@@ -1,4 +1,5 @@
-require('dotenv').config();
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 const express = require('express');
 const { PrismaClient, Prisma } = require('@prisma/client');
 const jwt = require('jsonwebtoken');
@@ -12,6 +13,14 @@ const multer = require('multer');
 const sharp = require('sharp');
 const FraudEngine = require('./utils/fraudEngine');
 const paymentService = require('./services/paymentService');
+
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] uncaughtException:', err);
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error('[FATAL] unhandledRejection:', err);
+});
 
 // --- Admin Plans (subscription/quotas) ---
 
