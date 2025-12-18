@@ -65,6 +65,10 @@ function normalizeAdminPlan(plan, planConfig = DEFAULT_PLAN_CONFIG) {
 }
 
 async function ensureDbColumns() {
+  const databaseUrl = String(process.env.DATABASE_URL || '');
+  // En MySQL/MariaDB el esquema se maneja con migraciones de Prisma.
+  // Las sentencias de este helper son específicas de Postgres y solo generan ruido/errores.
+  if (databaseUrl.startsWith('mysql://')) return;
   try {
     await prisma.$executeRawUnsafe('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "adminPlan" JSONB;');
 
@@ -219,6 +223,21 @@ const prisma = new PrismaClient();
 
 // Subidas grandes (imagenes) se manejan por multipart; igual aumentamos el límite JSON para data URLs/base64.
 app.use(express.json({ limit: '25mb' }));
+
+// Healthchecks (útiles para validar Passenger / dominio)
+app.get('/', (_req, res) => {
+  res.json({ ok: true, service: 'megarifas-api', env: process.env.NODE_ENV || 'development' });
+});
+
+app.get('/health', async (_req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    res.json({ ok: true, db: true });
+  } catch (e) {
+    console.error('[HEALTH] DB check failed:', e?.message || e);
+    res.status(500).json({ ok: false, db: false });
+  }
+});
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 
