@@ -4973,12 +4973,13 @@ app.get('/debug/test-email', async (req, res) => {
 // Start Server with DB Check and Error Handling
 async function startServer() {
   console.log('Iniciando proceso de arranque del servidor...');
+  const port = Number(process.env.PORT) || 3000;
   
   // 1. Iniciar servidor HTTP inmediatamente para satisfacer a Render (evitar timeout 502)
-  const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`✅ Servidor backend escuchando en el puerto ${PORT} (Accesible desde red)`);
+  const server = app.listen(port, '0.0.0.0', () => {
+    console.log(`✅ Servidor backend escuchando en el puerto ${port} (Accesible desde red)`);
     console.log(`   - Ambiente: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`   - URL Local: http://localhost:${PORT}`);
+    console.log(`   - URL Local: http://localhost:${port}`);
   });
 
   // 2. Conectar a la base de datos en segundo plano
