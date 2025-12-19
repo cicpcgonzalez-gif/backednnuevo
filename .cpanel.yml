@@ -1,7 +1,7 @@
 deployment:
   tasks:
     # Default deploy path under HOME (can be overridden if the platform sets DEPLOYPATH)
-    - export DEPLOYPATH="${DEPLOYPATH:-$HOME/backendrifas_deploy}"
+    - export DEPLOYPATH="${DEPLOYPATH:-$HOME/repositories/backendrifas}"
     - /bin/mkdir -p "$DEPLOYPATH"
     # Prefer rsync if available; fallback to tar-based copy.
     - |

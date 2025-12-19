@@ -17,29 +17,20 @@ const bcrypt = require('bcryptjs');
     const prisma = new PrismaClient();
     const email = 'rifa@megarifasapp.com';
     const passwordPlain = 'rifasadmin123';
-    const specialSecurityId = 'MR-SADM-1';
 
     console.log('Comprobando existencia de superadmin...');
     const existing = await prisma.user.findUnique({ where: { email } });
     if (existing) {
       console.log('Superadmin ya existe:', existing.email);
-      if (!existing.securityId) {
-        try {
-          await prisma.user.update({ where: { email }, data: { securityId: specialSecurityId } });
-          console.log('SecurityId especial asignado al superadmin:', specialSecurityId);
-        } catch (e) {
-          console.warn('No se pudo asignar securityId especial (posible colisión):', e.message || e);
-        }
-      }
     } else {
       const hashed = await bcrypt.hash(passwordPlain, 10);
       // Intentamos crear con campo `role` si existe en el esquema; si falla, intentamos sin role.
       try {
-        await prisma.user.create({ data: { email, name: 'Super Admin', password: hashed, role: 'superadmin', securityId: specialSecurityId } });
+        await prisma.user.create({ data: { email, name: 'Super Admin', password: hashed, role: 'superadmin' } });
         console.log('Superadmin creado correctamente (with role)');
       } catch (err) {
         console.warn('No se pudo crear con campo role (posible esquema sin role), intentando sin role:', err.message || err);
-        await prisma.user.create({ data: { email, name: 'Super Admin', password: hashed, securityId: specialSecurityId } });
+        await prisma.user.create({ data: { email, name: 'Super Admin', password: hashed } });
         console.log('Superadmin creado correctamente (without role)');
       }
     }

@@ -3,6 +3,3 @@ node_modules
 .env
 
 /generated/prisma
-
-# Temp/debug dumps
-ui_dump.xml

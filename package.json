@@ -11,7 +11,6 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "migrate": "prisma migrate deploy || prisma db push",
     "seed:superadmin": "node create_superadmin.js",
-    "reset:to-superadmin": "node scripts/reset_to_superadmin.js",
     "postinstall": "prisma generate",
     "android": "expo run:android",
     "ios": "expo run:ios"
@@ -25,17 +24,15 @@
     "compression": "^1.8.1",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
-    "exceljs": "^4.4.0",
     "expo-server-sdk": "^4.0.0",
     "express": "^5.2.1",
     "express-rate-limit": "^8.2.1",
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.3",
-    "multer": "^2.0.2",
     "node-cron": "^4.2.1",
     "nodemailer": "^7.0.11",
+    "exceljs": "^4.4.0",
     "prisma": "^4.15.0",
-    "sharp": "^0.34.5",
     "uuid": "^13.0.0"
   },
   "devDependencies": {
