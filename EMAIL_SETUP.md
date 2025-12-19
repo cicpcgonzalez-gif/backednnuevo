@@ -28,6 +28,30 @@ Content-Type: application/json
 ```
 Se guarda en `SystemSettings.smtp` y se usa en caliente sin reiniciar.
 
+### Ejemplo con Resend (SMTP)
+```json
+{
+  "host": "smtp.resend.com",
+  "port": 465,
+  "secure": true,
+  "user": "resend",
+  "pass": "re_TU_API_KEY_DE_RESEND",
+  "fromName": "MegaRifas",
+  "fromEmail": "no-reply@megarifas.com.ve"
+}
+```
+
+Para alto flujo, el backend usa `pool: true` (reutiliza conexiones) y permite ajustar el throttle con estas env vars opcionales:
+- `SMTP_POOL_MAX_CONNECTIONS` (default 2)
+- `SMTP_POOL_MAX_MESSAGES` (default 100)
+- `SMTP_POOL_RATE_DELTA_MS` (default 1000)
+- `SMTP_POOL_RATE_LIMIT` (default 10)
+
+Si vas a enviar correos masivos (broadcast), también puedes ajustar:
+- `MASS_EMAIL_PAGE_SIZE` (default 500)
+- `MASS_EMAIL_CONCURRENCY` (default 3)
+- `MASS_EMAIL_DELAY_MS` (default 400)
+
 ## Opción B: Variables de entorno (Render u host)
 Define estas env vars antes de arrancar el backend:
 - `SMTP_HOST`

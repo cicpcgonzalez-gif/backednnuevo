@@ -621,6 +621,50 @@ let defaultTransporter = nodemailer.createTransport({
   }
 });
 
+let cachedDbSmtpKey = null;
+let cachedDbTransporter = null;
+let cachedDbFromAddress = null;
+
+function normalizeBoolean(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') return value.toLowerCase() === 'true';
+  return false;
+}
+
+function buildSmtpCacheKey(smtp) {
+  if (!smtp || typeof smtp !== 'object') return '';
+  const host = String(smtp.host || '');
+  const port = String(Number(smtp.port) || 0);
+  const secure = String(normalizeBoolean(smtp.secure));
+  const user = String(smtp.user || '');
+  const pass = String(smtp.pass || '');
+  const fromName = String(smtp.fromName || '');
+  const fromEmail = String(smtp.fromEmail || '');
+  return [host, port, secure, user, pass, fromName, fromEmail].join('|');
+}
+
+function createDbSmtpTransporter(smtp) {
+  const maxConnections = Number(process.env.SMTP_POOL_MAX_CONNECTIONS || 2);
+  const maxMessages = Number(process.env.SMTP_POOL_MAX_MESSAGES || 100);
+  const rateDelta = Number(process.env.SMTP_POOL_RATE_DELTA_MS || 1000);
+  const rateLimit = Number(process.env.SMTP_POOL_RATE_LIMIT || 10);
+
+  return nodemailer.createTransport({
+    host: smtp.host,
+    port: Number(smtp.port) || 587,
+    secure: normalizeBoolean(smtp.secure),
+    auth: {
+      user: smtp.user,
+      pass: smtp.pass
+    },
+    pool: true,
+    maxConnections: Number.isFinite(maxConnections) ? maxConnections : 2,
+    maxMessages: Number.isFinite(maxMessages) ? maxMessages : 100,
+    rateDelta: Number.isFinite(rateDelta) ? rateDelta : 1000,
+    rateLimit: Number.isFinite(rateLimit) ? rateLimit : 10
+  });
+}
+
 // Si no hay password, usar Ethereal para dev
 if (!process.env.SMTP_PASS) {
   console.log('⚠️ No SMTP_PASS provided. Using Ethereal email for testing.');
@@ -697,17 +741,15 @@ async function sendEmail(to, subject, text, html, options = {}) {
 
     if (settings && settings.smtp) {
       const smtp = settings.smtp;
-      if (smtp.host && smtp.user && smtp.pass) {
-        transporter = nodemailer.createTransport({
-          host: smtp.host,
-          port: Number(smtp.port) || 587,
-          secure: smtp.secure === true || smtp.secure === 'true',
-          auth: {
-            user: smtp.user,
-            pass: smtp.pass
-          }
-        });
-        fromAddress = `"${smtp.fromName || 'MegaRifas'}" <${smtp.fromEmail || smtp.user}>`;
+      if (smtp && smtp.host && smtp.user && smtp.pass) {
+        const key = buildSmtpCacheKey(smtp);
+        if (!cachedDbTransporter || cachedDbSmtpKey !== key) {
+          cachedDbSmtpKey = key;
+          cachedDbTransporter = createDbSmtpTransporter(smtp);
+          cachedDbFromAddress = `"${smtp.fromName || 'MegaRifas'}" <${smtp.fromEmail || smtp.user}>`;
+        }
+        transporter = cachedDbTransporter;
+        fromAddress = cachedDbFromAddress;
       }
     } else if (!smtpHost && !smtpPass) {
       // Si no hay config en DB ni en ENV, mock
@@ -754,6 +796,42 @@ function parseEmailList(value) {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function sendBulkEmails(recipients, { subject, text, html, forceSmtp = true } = {}) {
+  const list = Array.isArray(recipients) ? recipients.filter(Boolean) : [];
+  const concurrency = Number(process.env.MASS_EMAIL_CONCURRENCY || 3);
+  const delayMs = Number(process.env.MASS_EMAIL_DELAY_MS || 400);
+
+  let sent = 0;
+  let failed = 0;
+
+  for (let i = 0; i < list.length; i += Math.max(1, concurrency)) {
+    const chunk = list.slice(i, i + Math.max(1, concurrency));
+    const results = await Promise.allSettled(
+      chunk.map((to) => sendEmail(to, subject, text, html, { forceSmtp }))
+    );
+    for (const r of results) {
+      if (r.status === 'fulfilled' && r.value === true) sent += 1;
+      else failed += 1;
+    }
+    if (delayMs > 0 && i + concurrency < list.length) await sleep(delayMs);
+  }
+
+  return { sent, failed, total: list.length };
 }
 
 function formatDateYYYYMMDD(date) {
@@ -1248,6 +1326,74 @@ app.post('/raffles/:id/react', authenticateToken, async (req, res) => {
       return res.status(503).json({ error: 'Función no disponible: falta aplicar migración de reacciones de rifas (RaffleReaction).' });
     }
     return res.status(500).json({ error: 'Error al reaccionar' });
+  }
+});
+
+// --- REPORTES / DENUNCIAS ---
+app.post('/reports', authenticateToken, async (req, res) => {
+  try {
+    const reporterUserId = Number(req.user?.userId);
+    const reportedUserId = Number(req.body?.reportedUserId);
+    const raffleIdRaw = req.body?.raffleId;
+    const raffleId = raffleIdRaw == null || raffleIdRaw === '' ? null : Number(raffleIdRaw);
+    const reason = String(req.body?.reason || '').trim();
+    const details = String(req.body?.details || '').trim();
+
+    if (!Number.isFinite(reporterUserId)) return res.status(401).json({ error: 'Token inválido' });
+    if (!Number.isFinite(reportedUserId)) return res.status(400).json({ error: 'Usuario reportado inválido' });
+    if (reportedUserId === reporterUserId) return res.status(400).json({ error: 'No puedes reportarte a ti mismo' });
+    if (!reason) return res.status(400).json({ error: 'Motivo requerido' });
+    if (details && details.length > 1000) return res.status(400).json({ error: 'Detalle demasiado largo' });
+
+    const reportedUser = await prisma.user.findUnique({ where: { id: reportedUserId }, select: { id: true } });
+    if (!reportedUser) return res.status(404).json({ error: 'Usuario reportado no existe' });
+
+    if (raffleId != null) {
+      if (!Number.isFinite(raffleId)) return res.status(400).json({ error: 'Rifa inválida' });
+      const raffle = await prisma.raffle.findUnique({ where: { id: raffleId }, select: { id: true } });
+      if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
+    }
+
+    const created = await prisma.report.create({
+      data: {
+        reporterUserId,
+        reportedUserId,
+        raffleId: raffleId == null ? null : raffleId,
+        reason,
+        details: details || null,
+        status: 'open'
+      }
+    });
+
+    try {
+      await prisma.auditLog.create({
+        data: {
+          action: 'REPORT_CREATED',
+          userId: reporterUserId,
+          userEmail: String(req.user?.email || ''),
+          entity: 'Report',
+          entityId: String(created.id),
+          detail: `Reporte creado. Motivo=${reason} ReportadoUserId=${reportedUserId}`,
+          ipAddress: String(req.ip || ''),
+          userAgent: String(req.headers['user-agent'] || ''),
+          severity: 'INFO',
+          metadata: {
+            reportedUserId,
+            raffleId: raffleId == null ? null : raffleId
+          }
+        }
+      });
+    } catch (_e) {
+      // No bloquear el flujo de reportes por auditoría
+    }
+
+    return res.status(201).json({ id: created.id, status: created.status });
+  } catch (error) {
+    console.error('[REPORTS] create error:', error);
+    if (isPrismaMissingTableError(error)) {
+      return res.status(503).json({ error: 'Función no disponible: falta aplicar migración de reportes (Report).' });
+    }
+    return res.status(500).json({ error: 'No se pudo crear el reporte' });
   }
 });
 
@@ -1893,10 +2039,15 @@ app.put('/raffles/:id', authenticateToken, authorizeRole(['admin', 'superadmin']
   }
 });
 
-app.delete('/raffles/:id', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+app.delete('/raffles/:id', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
   const { id } = req.params;
   try {
-    await prisma.raffle.delete({ where: { id: Number(id) } });
+    const raffleId = Number(id);
+    await prisma.$transaction(async (tx) => {
+      await tx.ticket.deleteMany({ where: { raffleId } });
+      await tx.winner.deleteMany({ where: { raffleId } });
+      await tx.raffle.delete({ where: { id: raffleId } });
+    });
     res.json({ message: 'Rifa eliminada' });
   } catch (error) {
     res.status(500).json({ error: 'Error al eliminar rifa' });
@@ -2047,9 +2198,11 @@ app.post('/raffles/:id/purchase', authenticateToken, async (req, res) => {
       await tx.transaction.create({
         data: {
           userId,
+          raffleId: Number(id),
           amount: totalCost,
           type: 'purchase',
           status: 'approved',
+          provider: 'wallet',
           reference: `Compra de ${qty} tickets en rifa #${id}`
         }
       });
@@ -2090,24 +2243,83 @@ app.get('/me/raffles', authenticateToken, async (req, res) => {
   try {
     const tickets = await prisma.ticket.findMany({
       where: { userId: req.user.userId },
-      include: { raffle: true }
+      include: {
+        raffle: {
+          include: {
+            user: {
+              select: {
+                id: true,
+                name: true,
+                avatar: true,
+                securityId: true,
+                identityVerified: true,
+                isBoosted: true,
+                boostEndsAt: true
+              }
+            }
+          }
+        }
+      }
     });
     
+    const raffleIds = Array.from(new Set((tickets || []).map((t) => t.raffleId).filter(Boolean)));
+    const purchases = raffleIds.length
+      ? await prisma.transaction.findMany({
+          where: {
+            userId: req.user.userId,
+            raffleId: { in: raffleIds },
+            type: 'purchase'
+          },
+          orderBy: { createdAt: 'asc' }
+        })
+      : [];
+
+    const purchaseByRaffle = {};
+    for (const p of purchases) {
+      const rid = p.raffleId;
+      if (!rid) continue;
+      if (!purchaseByRaffle[rid]) {
+        purchaseByRaffle[rid] = {
+          totalSpent: 0,
+          purchasedAt: null,
+          method: null
+        };
+      }
+      const amount = Number(p.amount);
+      if (Number.isFinite(amount)) purchaseByRaffle[rid].totalSpent += amount;
+      purchaseByRaffle[rid].purchasedAt = p.createdAt;
+      purchaseByRaffle[rid].method = p.provider || purchaseByRaffle[rid].method;
+    }
+
     const grouped = {};
-    tickets.forEach(t => {
+    for (const t of tickets) {
+      if (!t) continue;
       if (!grouped[t.raffleId]) {
+        const raffle = t.raffle || {};
+        const seller = raffle.user || null;
+        const sellerSafe = seller
+          ? {
+              ...seller,
+              name: seller.name ? safeDecrypt(seller.name) : seller.name
+            }
+          : null;
         grouped[t.raffleId] = {
-          raffle: t.raffle,
+          raffle: sellerSafe ? { ...raffle, user: sellerSafe } : raffle,
           numbers: [],
           serialNumber: t.serialNumber,
-          status: t.raffle.status,
+          status: raffle.status,
           isWinner: false,
-          createdAt: t.createdAt
+          createdAt: t.createdAt,
+          payment: purchaseByRaffle[t.raffleId] || { totalSpent: null, purchasedAt: null, method: null }
         };
       }
       grouped[t.raffleId].numbers.push(t.number);
-    });
-    
+      // La fecha/hora más útil para el usuario es la del último ticket de esa rifa (aprox. última compra)
+      if (t.createdAt && (!grouped[t.raffleId].createdAt || t.createdAt > grouped[t.raffleId].createdAt)) {
+        grouped[t.raffleId].createdAt = t.createdAt;
+      }
+    }
+
     res.json(Object.values(grouped));
   } catch (error) {
     console.error(error);
@@ -3351,7 +3563,11 @@ app.get('/admin/system/fix-db', async (req, res) => {
 app.post('/raffles/:id/close', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
   const { id } = req.params;
   try {
-    const raffle = await prisma.raffle.findUnique({ where: { id: Number(id) } });
+    const raffleId = Number(id);
+    const raffle = await prisma.raffle.findUnique({
+      where: { id: raffleId },
+      include: { user: { select: { id: true, role: true } } }
+    });
     if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
 
     const actorRole = String(req.user?.role || '').toLowerCase();
@@ -3365,7 +3581,7 @@ app.post('/raffles/:id/close', authenticateToken, authorizeRole(['admin', 'super
     if (currentStatus !== 'active') return res.status(400).json({ error: 'Solo puedes cerrar rifas activas.' });
 
     // 1. Buscar tickets vendidos
-    const tickets = await prisma.ticket.findMany({ where: { raffleId: Number(id), status: 'approved' } });
+    const tickets = await prisma.ticket.findMany({ where: { raffleId, status: 'approved' } });
     if (tickets.length === 0) return res.status(400).json({ error: 'No hay tickets vendidos para sortear' });
 
     // 2. Elegir ganador aleatorio
@@ -3376,18 +3592,40 @@ app.post('/raffles/:id/close', authenticateToken, authorizeRole(['admin', 'super
     // Nota: Esto es un sorteo interno. Si es por lotería externa, el admin usa "Publicar Ganador" manualmente.
     // Pero si usa este botón "Cerrar Rifa", asumimos que quiere que el sistema elija.
     
+    const creatorRole = String(raffle?.user?.role || '').toLowerCase();
+    const shouldAutoDelete = creatorRole === 'admin';
+
+    if (shouldAutoDelete) {
+      await prisma.$transaction(async (tx) => {
+        await tx.ticket.deleteMany({ where: { raffleId } });
+        await tx.winner.deleteMany({ where: { raffleId } });
+        await tx.raffle.delete({ where: { id: raffleId } });
+      });
+
+      return res.json({
+        message: 'Sorteo realizado. Esta rifa (creada por admin) fue eliminada automáticamente al finalizar.',
+        winner: {
+          number: winningTicket.number,
+          userId: winningTicket.userId,
+          serial: winningTicket.serialNumber
+        },
+        raffleDeleted: true
+      });
+    }
+
     await prisma.raffle.update({
-      where: { id: Number(id) },
+      where: { id: raffleId },
       data: { status: 'closed', closedAt: new Date() }
     });
-    
-    res.json({ 
-      message: 'Sorteo realizado', 
+
+    return res.json({
+      message: 'Sorteo realizado',
       winner: {
         number: winningTicket.number,
         userId: winningTicket.userId,
         serial: winningTicket.serialNumber
-      }
+      },
+      raffleDeleted: false
     });
   } catch (error) {
     console.error(error);
@@ -3617,6 +3855,80 @@ app.get('/superadmin/audit/actions', authenticateToken, authorizeRole(['superadm
     res.json(logs);
   } catch (error) {
     res.status(500).json({ error: 'Error al obtener logs de auditoría' });
+  }
+});
+
+app.get('/superadmin/reports', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
+  try {
+    const status = String(req.query?.status || '').trim().toLowerCase();
+    const where = status ? { status } : {};
+
+    const reports = await prisma.report.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: 200,
+      include: {
+        reporter: { select: { id: true, name: true, email: true, avatar: true } },
+        reported: { select: { id: true, name: true, email: true, avatar: true } },
+        reviewedBy: { select: { id: true, name: true, email: true } },
+        raffle: { select: { id: true, title: true, status: true, createdAt: true } }
+      }
+    });
+
+    return res.json(reports);
+  } catch (error) {
+    console.error('[REPORTS][SUPERADMIN] list error:', error);
+    if (isPrismaMissingTableError(error)) {
+      return res.status(503).json({ error: 'Función no disponible: falta aplicar migración de reportes (Report).' });
+    }
+    return res.status(500).json({ error: 'Error al obtener reportes' });
+  }
+});
+
+app.patch('/superadmin/reports/:id', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
+  try {
+    const reportId = Number(req.params.id);
+    const nextStatus = String(req.body?.status || '').trim().toLowerCase();
+    const allowed = new Set(['open', 'reviewed', 'resolved', 'dismissed']);
+
+    if (!Number.isFinite(reportId)) return res.status(400).json({ error: 'ID inválido' });
+    if (!allowed.has(nextStatus)) return res.status(400).json({ error: 'Estado inválido' });
+
+    const updated = await prisma.report.update({
+      where: { id: reportId },
+      data: {
+        status: nextStatus,
+        reviewedById: Number(req.user?.userId) || null,
+        reviewedAt: new Date()
+      }
+    });
+
+    try {
+      await prisma.auditLog.create({
+        data: {
+          action: 'REPORT_STATUS_UPDATED',
+          userId: Number(req.user?.userId) || null,
+          userEmail: String(req.user?.email || ''),
+          entity: 'Report',
+          entityId: String(updated.id),
+          detail: `Reporte actualizado. Status=${nextStatus}`,
+          ipAddress: String(req.ip || ''),
+          userAgent: String(req.headers['user-agent'] || ''),
+          severity: 'INFO',
+          metadata: { status: nextStatus }
+        }
+      });
+    } catch (_e) {
+      // No bloquear
+    }
+
+    return res.json({ id: updated.id, status: updated.status });
+  } catch (error) {
+    console.error('[REPORTS][SUPERADMIN] update error:', error);
+    if (isPrismaMissingTableError(error)) {
+      return res.status(503).json({ error: 'Función no disponible: falta aplicar migración de reportes (Report).' });
+    }
+    return res.status(500).json({ error: 'Error al actualizar reporte' });
   }
 });
 
@@ -4771,7 +5083,7 @@ app.get('/announcements', async (req, res) => {
 
 app.post('/admin/announcements', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
   try {
-    const { title, content, imageUrl } = req.body;
+    const { title, content, imageUrl, sendEmail: sendEmailFlag } = req.body;
     if (!title || !content) return res.status(400).json({ error: 'Título y contenido requeridos' });
 
     const announcement = await prisma.announcement.create({
@@ -4782,7 +5094,101 @@ app.post('/admin/announcements', authenticateToken, authorizeRole(['admin', 'sup
         adminId: req.user.userId
       }
     });
+
     res.json(announcement);
+
+    const shouldSendEmail = sendEmailFlag === true;
+    if (shouldSendEmail) {
+      const adminId = req.user.userId;
+      setImmediate(async () => {
+        const startedAt = Date.now();
+        let totalSent = 0;
+        let totalFailed = 0;
+
+        try {
+          const safeTitle = String(title || '').trim();
+          const safeContent = String(content || '').trim();
+
+          const subject = `MegaRifas: ${safeTitle}`;
+          const text = `${safeTitle}\n\n${safeContent}\n\nAbre la app para más detalles.`;
+          const imageBlock = imageUrl ? `<p><img alt="" src="${escapeHtml(imageUrl)}" style="max-width:100%;height:auto;" /></p>` : '';
+          const html = `
+            <div>
+              <h2>${escapeHtml(safeTitle)}</h2>
+              <p>${escapeHtml(safeContent).replace(/\n/g, '<br/>')}</p>
+              ${imageBlock}
+              <p style="font-size:12px;color:#666">Abre la app para más detalles.</p>
+            </div>
+          `.trim();
+
+          let lastId = 0;
+          const pageSize = Number(process.env.MASS_EMAIL_PAGE_SIZE || 500);
+
+          while (true) {
+            const users = await prisma.user.findMany({
+              where: {
+                id: { gt: lastId },
+                active: true,
+                verified: true,
+                role: 'user'
+              },
+              select: { id: true, email: true },
+              orderBy: { id: 'asc' },
+              take: Number.isFinite(pageSize) ? pageSize : 500
+            });
+
+            if (!users.length) break;
+            lastId = users[users.length - 1].id;
+
+            const recipients = users.map((u) => u.email).filter(Boolean);
+            const summary = await sendBulkEmails(recipients, { subject, text, html, forceSmtp: true });
+            totalSent += summary.sent;
+            totalFailed += summary.failed;
+
+            console.log(
+              `[BROADCAST EMAIL] announcementId=${announcement.id} batch=${recipients.length} sent=${summary.sent} failed=${summary.failed} lastUserId=${lastId}`
+            );
+          }
+
+          try {
+            await prisma.auditLog.create({
+              data: {
+                action: 'EMAIL_BROADCAST',
+                userId: adminId,
+                entity: 'Announcement',
+                entityId: String(announcement.id),
+                detail: `Broadcast announcement email sent=${totalSent} failed=${totalFailed}`,
+                severity: totalFailed > 0 ? 'WARN' : 'INFO',
+                metadata: { announcementId: announcement.id, sent: totalSent, failed: totalFailed }
+              }
+            });
+          } catch (_e) {
+            // ignore audit log failures
+          }
+
+          console.log(
+            `[BROADCAST EMAIL] DONE announcementId=${announcement.id} sent=${totalSent} failed=${totalFailed} ms=${Date.now() - startedAt}`
+          );
+        } catch (e) {
+          console.error(`[BROADCAST EMAIL] FAILED announcementId=${announcement.id}`, e);
+          try {
+            await prisma.auditLog.create({
+              data: {
+                action: 'EMAIL_BROADCAST_FAILED',
+                userId: adminId,
+                entity: 'Announcement',
+                entityId: String(announcement.id),
+                detail: String(e?.message || e),
+                severity: 'ERROR',
+                metadata: { announcementId: announcement.id }
+              }
+            });
+          } catch (_e2) {
+            // ignore
+          }
+        }
+      });
+    }
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Error al crear anuncio' });

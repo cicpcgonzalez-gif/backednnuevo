@@ -1,16 +1,24 @@
+databases:
+  - name: rifas-db
+    plan: starter
+    databaseName: rifasdb
+    user: rifasuser
+
 services:
   - type: web
     name: rifas-backend
     env: node
-    plan: free
+    plan: starter
     buildCommand: npm ci && npx prisma generate
     startCommand: npx prisma migrate deploy && npm start
     envVars:
       - key: NODE_VERSION
         value: 20
       - key: DATABASE_URL
-        sync: false
+        fromDatabase:
+          name: rifas-db
+          property: connectionString
       - key: JWT_SECRET
-        sync: false
+        generateValue: true
       - key: PORT
         value: 10000
