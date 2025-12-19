@@ -46,6 +46,9 @@ model User {
   referredBy        User?          @relation("Referrals", fields: [referredById], references: [id])
   referrals         User[]         @relation("Referrals")
   wins              Winner[]
+  reportsSent       Report[]       @relation("ReportsSent")
+  reportsReceived   Report[]       @relation("ReportsReceived")
+  reportsReviewed   Report[]       @relation("ReportsReviewedBy")
 }
 
 model Winner {
@@ -113,6 +116,7 @@ model Raffle {
   user         User?    @relation("UserRaffles", fields: [userId], references: [id])
   tickets      Ticket[]
   winners      Winner[]
+  reports      Report[]
 }
 
 model Transaction {
@@ -204,4 +208,31 @@ model Blacklist {
   source         String   // OFAC, UN, INTERNAL, POLICE
   riskLevel      String   @default("HIGH") // HIGH, CRITICAL
   createdAt      DateTime @default(now())
+
+}
+
+model Report {
+  id             Int       @id @default(autoincrement())
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  status         String    @default("pending") // pending, reviewed, resolved, rejected
+
+  reporterId     Int
+  reporter       User      @relation("ReportsSent", fields: [reporterId], references: [id])
+
+  reportedUserId Int?
+  reportedUser   User?     @relation("ReportsReceived", fields: [reportedUserId], references: [id])
+
+  raffleId       Int?
+  raffle         Raffle?   @relation(fields: [raffleId], references: [id])
+
+  category       String?
+  answers        Json?
+  comment        String?
+  metadata       Json?
+
+  reviewedById   Int?
+  reviewedBy     User?     @relation("ReportsReviewedBy", fields: [reviewedById], references: [id])
+  reviewedAt     DateTime?
+  resolution     String?
 }

@@ -3,9 +3,11 @@ services:
     name: rifas-backend
     env: node
     plan: free
-    buildCommand: npm install && npx prisma generate
-    startCommand: npm start
+    buildCommand: npm ci && npx prisma generate
+    startCommand: npx prisma migrate deploy && npm start
     envVars:
+      - key: NODE_VERSION
+        value: 20
       - key: DATABASE_URL
         sync: false
       - key: JWT_SECRET
