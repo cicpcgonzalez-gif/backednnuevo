@@ -1,7 +1,16 @@
 deployment:
   tasks:
-    # Default deploy path under HOME (can be overridden if the platform sets DEPLOYPATH)
-    - export DEPLOYPATH="${DEPLOYPATH:-$HOME/repositories/backendrifas}"
+    # IMPORTANT: Do NOT deploy into the same directory where cPanel checks out the repo.
+    # If you deploy into the repo path, cPanel will detect a dirty working tree and refuse to deploy.
+    # Override DEPLOYPATH in cPanel if needed.
+    - |
+      REPOROOT="$(pwd)"
+      DEPLOYPATH="${DEPLOYPATH:-$HOME/repositories/backendrifas_deploy}"
+      if [ "$DEPLOYPATH" = "$REPOROOT" ]; then
+        echo "ERROR: DEPLOYPATH points to the repo root ($REPOROOT). Choose a different deploy directory."
+        exit 1
+      fi
+      export DEPLOYPATH
     - /bin/mkdir -p "$DEPLOYPATH"
     # Prefer rsync if available; fallback to tar-based copy.
     - |
