@@ -1351,8 +1351,8 @@ app.post('/verify-email', async (req, res) => {
 });
 
 // Reenviar código de verificación
-app.post('/resend-code', async (req, res) => {
-  const { email } = req.body;
+async function resendVerificationCodeHandler(req, res) {
+  const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Email requerido' });
 
   try {
@@ -1373,11 +1373,55 @@ app.post('/resend-code', async (req, res) => {
       `<h1>Código de Verificación</h1><p>Tu nuevo código es:</p><h2>${verificationToken}</h2>`
     );
 
-    res.json({ message: 'Código reenviado exitosamente' });
+    return res.json({ message: 'Código reenviado exitosamente' });
   } catch (error) {
     console.error('Error resending code:', error);
-    res.status(500).json({ error: 'Error al reenviar código' });
+    return res.status(500).json({ error: 'Error al reenviar código' });
   }
+}
+
+app.post('/resend-code', resendVerificationCodeHandler);
+// Alias esperado por la app móvil (histórico)
+app.post('/auth/verify/resend', resendVerificationCodeHandler);
+
+// Password reset (request) - endpoint esperado por la app móvil.
+// Nota: esta versión envía un correo informativo; no cambia contraseña directamente.
+app.post('/auth/password/reset/request', async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'Email requerido' });
+
+  try {
+    const user = await prisma.user.findUnique({ where: { email } });
+
+    // Evitar enumeración de usuarios: respondemos OK aunque no exista.
+    if (!user) {
+      return res.json({ message: 'Si el correo existe, enviaremos instrucciones.' });
+    }
+
+    const webBaseUrl = String(process.env.WEB_BASE_URL || '').trim();
+    const resetToken = jwt.sign({ email, purpose: 'password_reset' }, JWT_SECRET, { expiresIn: '15m' });
+    const resetLink = webBaseUrl ? `${webBaseUrl.replace(/\/$/, '')}/recuperar?token=${encodeURIComponent(resetToken)}` : null;
+
+    const subject = 'Recuperación de contraseña - MegaRifas';
+    const text = resetLink
+      ? `Para recuperar tu contraseña, abre este enlace (válido por 15 minutos): ${resetLink}`
+      : 'Solicitaste recuperación de contraseña. Contacta a soporte o intenta nuevamente más tarde.';
+    const html = resetLink
+      ? `<h1>Recuperación de contraseña</h1><p>Para recuperar tu contraseña, haz clic aquí (válido por 15 minutos):</p><p><a href="${escapeHtml(resetLink)}">Recuperar contraseña</a></p>`
+      : '<h1>Recuperación de contraseña</h1><p>Solicitaste recuperación de contraseña. Contacta a soporte o intenta nuevamente más tarde.</p>';
+
+    await sendEmail(email, subject, text, html).catch(console.error);
+    return res.json({ message: 'Hemos enviado instrucciones a tu correo.' });
+  } catch (error) {
+    console.error('Password reset request error:', error);
+    return res.status(500).json({ error: 'Error al solicitar recuperación' });
+  }
+});
+
+// Refresh token endpoint esperado por la app móvil.
+// Si no manejas refresh tokens, respondemos JSON (no HTML/404) para evitar errores.
+app.post('/auth/refresh', async (_req, res) => {
+  return res.status(501).json({ error: 'Refresh token no soportado en esta versión.' });
 });
 
 // Login de usuario
