@@ -4968,6 +4968,8 @@ app.get('/debug/test-email', async (req, res) => {
   }
 });
 
+});
+
 // Start Server with DB Check and Error Handling
 async function startServer() {
   console.log('Iniciando proceso de arranque del servidor...');
@@ -5018,6 +5020,8 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
+
+
 startServer();
 
 // Middleware global de manejo de errores (SIEMPRE al final)
@@ -5033,3 +5037,5 @@ app.use((err, req, res, next) => {
     details: process.env.NODE_ENV === 'development' ? err.stack : undefined
   });
 });
+
+
