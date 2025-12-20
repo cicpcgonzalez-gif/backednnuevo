@@ -192,7 +192,8 @@ const loginLimiter = rateLimit({
 // Inicializar Prisma
 const prisma = new PrismaClient();
 
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 
