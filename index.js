@@ -197,6 +197,8 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 
+const generateTxCode = () => `TX-${crypto.randomBytes(10).toString('hex').toUpperCase()}`;
+
 const SUPERADMIN_EMAIL = 'rifa@megarifasapp.com';
 const SUPERADMIN_PASSWORD = 'rifasadmin123';
 const SUPERADMIN_ROLE = 'superadmin';
@@ -1847,6 +1849,7 @@ app.post('/raffles/:id/purchase', authenticateToken, async (req, res) => {
 
       await tx.transaction.create({
         data: {
+          txCode: generateTxCode(),
           userId,
           raffleId: Number(id),
           amount: totalCost,
@@ -3341,7 +3344,7 @@ app.get('/wallet', authenticateToken, async (req, res) => {
 });
 
 app.post('/wallet/topup', authenticateToken, async (req, res) => {
-  const { amount } = req.body;
+  const { amount, provider } = req.body;
   if (!amount || amount <= 0) return res.status(400).json({ error: 'Monto inválido' });
 
   try {
@@ -3352,10 +3355,12 @@ app.post('/wallet/topup', authenticateToken, async (req, res) => {
       }),
       prisma.transaction.create({
         data: {
+          txCode: generateTxCode(),
           userId: req.user.userId,
           amount: Number(amount),
           type: 'deposit',
           status: 'approved',
+          provider: provider ? String(provider) : 'manual',
           reference: encrypt('Recarga de saldo')
         }
       })
@@ -4850,6 +4855,121 @@ app.get('/', (req, res) => {
 });
 
 // --- GESTIÓN DE PAGOS MANUALES (Admin) ---
+
+// Listar movimientos/transacciones del sistema
+app.get('/admin/transactions', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const status = req.query.status ? String(req.query.status).trim().toLowerCase() : '';
+    const q = req.query.q ? String(req.query.q).trim() : '';
+    const limitRaw = Number(req.query.limit);
+    const take = Number.isFinite(limitRaw) ? Math.max(1, Math.min(500, Math.floor(limitRaw))) : 200;
+
+    const where = {};
+    if (status) where.status = status;
+
+    if (q) {
+      where.OR = [
+        { type: { contains: q, mode: 'insensitive' } },
+        { provider: { contains: q, mode: 'insensitive' } },
+        { externalId: { contains: q, mode: 'insensitive' } },
+        { txCode: { contains: q, mode: 'insensitive' } },
+        { user: { email: { contains: q, mode: 'insensitive' } } }
+      ];
+    }
+
+    const transactions = await prisma.transaction.findMany({
+      where,
+      include: {
+        user: { select: { id: true, name: true, email: true, state: true } }
+      },
+      orderBy: { createdAt: 'desc' },
+      take
+    });
+
+    // Backfill lazy: asigna txCode a registros viejos que no lo tengan
+    const txCodeById = new Map();
+    const missing = transactions.filter((t) => !t?.txCode);
+    for (const t of missing) {
+      let attempts = 0;
+      while (attempts < 3) {
+        attempts += 1;
+        const nextCode = generateTxCode();
+        try {
+          const updated = await prisma.transaction.update({
+            where: { id: t.id },
+            data: { txCode: nextCode }
+          });
+          txCodeById.set(updated.id, updated.txCode);
+          break;
+        } catch (_e) {
+          // unique collision muy improbable: reintentar
+        }
+      }
+    }
+
+    const mapped = transactions.map((t) => {
+      const safeRef = t.reference ? safeDecrypt(t.reference) : null;
+      const safeProof = t.proof ? safeDecrypt(t.proof) : null;
+      const safeUserName = t.user?.name ? safeDecrypt(t.user.name) : t.user?.name || null;
+      return {
+        ...t,
+        txCode: t.txCode || txCodeById.get(t.id) || null,
+        reference: safeRef,
+        proof: safeProof,
+        user: t.user ? { ...t.user, name: safeUserName } : null
+      };
+    });
+
+    res.json(mapped);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al obtener movimientos' });
+  }
+});
+
+// Verificar un número de transacción (auditable)
+app.get('/admin/transactions/verify/:txCode', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  const txCode = String(req.params.txCode || '').trim();
+  if (!txCode) return res.status(400).json({ error: 'txCode requerido' });
+
+  try {
+    const transaction = await prisma.transaction.findFirst({
+      where: { txCode },
+      include: { user: { select: { id: true, name: true, email: true } } }
+    });
+
+    const found = !!transaction;
+    try {
+      await prisma.auditLog.create({
+        data: {
+          action: found ? 'TRANSACTION_VERIFIED' : 'TRANSACTION_VERIFY_NOT_FOUND',
+          userId: req.user.userId,
+          userEmail: req.user.email,
+          entity: 'Transaction',
+          entityId: found ? String(transaction.id) : txCode,
+          detail: found ? `Verified txCode=${txCode}` : `Verify failed txCode=${txCode}`,
+          severity: found ? 'INFO' : 'WARN',
+          metadata: { txCode, found }
+        }
+      });
+    } catch (_e) {
+      // ignore audit log failures
+    }
+
+    if (!transaction) return res.status(404).json({ error: 'Transacción no encontrada' });
+
+    const safeUserName = transaction.user?.name ? safeDecrypt(transaction.user.name) : transaction.user?.name || null;
+    res.json({
+      ...transaction,
+      reference: transaction.reference ? safeDecrypt(transaction.reference) : null,
+      proof: transaction.proof ? safeDecrypt(transaction.proof) : null,
+      user: transaction.user ? { ...transaction.user, name: safeUserName } : null
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al verificar transacción' });
+  }
+});
 
 // Listar pagos manuales (permite filtrar y normaliza el proof para mostrar la imagen)
 app.get('/admin/manual-payments', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {

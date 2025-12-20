@@ -193,6 +193,7 @@ model UserBoost {
 
 model Transaction {
   id          Int      @id @default(autoincrement())
+  txCode      String?  @unique
   amount      Float
   currency    String   @default("VES") // VES, USD
   type        String   // purchase, deposit, withdrawal, refund

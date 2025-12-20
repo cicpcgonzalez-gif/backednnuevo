@@ -2,6 +2,8 @@ const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 const crypto = require('crypto');
 
+const generateTxCode = () => `TX-${crypto.randomBytes(10).toString('hex').toUpperCase()}`;
+
 // Mock implementation for external providers
 const providers = {
   stripe: {
@@ -56,6 +58,7 @@ class PaymentService {
 
       const transaction = await prisma.transaction.create({
         data: {
+          txCode: generateTxCode(),
           userId,
           amount,
           currency,
@@ -151,6 +154,7 @@ class PaymentService {
     // Create refund transaction
     const refundTx = await prisma.transaction.create({
       data: {
+        txCode: generateTxCode(),
         userId: originalTx.userId,
         amount: originalTx.amount,
         currency: originalTx.currency,
