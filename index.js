@@ -141,6 +141,117 @@ function normalizePaymentMethods(value) {
   return [];
 }
 
+function coerceDate(value) {
+  if (!value) return null;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  return d;
+}
+
+function getRaffleEndDate(raffle) {
+  try {
+    const style = raffle?.style && typeof raffle.style === 'object' ? raffle.style : null;
+    if (!style) return null;
+    // Compat: la app guarda startDate/endDate dentro de style
+    return coerceDate(style.endDate || style.end_date || style.endsAt || style.ends_at);
+  } catch (_e) {
+    return null;
+  }
+}
+
+async function closeRaffleInternal(raffleId, reason = 'system_time_endDate') {
+  const raffle = await prisma.raffle.findUnique({ where: { id: raffleId } });
+  if (!raffle) return { ok: false, code: 404, error: 'Rifa no encontrada' };
+
+  const status = String(raffle.status || '').toLowerCase();
+  if (status === 'closed') return { ok: false, code: 400, error: 'La rifa ya está cerrada.' };
+  if (status !== 'active') return { ok: false, code: 400, error: 'Solo puedes cerrar rifas activas.' };
+
+  const tickets = await prisma.ticket.findMany({ where: { raffleId, status: 'approved' } });
+  const nextStyle = raffle.style && typeof raffle.style === 'object'
+    ? { ...raffle.style, autoClose: { ...(raffle.style.autoClose || {}), at: new Date().toISOString(), reason } }
+    : { autoClose: { at: new Date().toISOString(), reason } };
+
+  // Si no hay tickets, cerramos igual (sin ganador)
+  if (!tickets.length) {
+    await prisma.raffle.update({
+      where: { id: raffleId },
+      data: { status: 'closed', closedAt: new Date(), style: nextStyle }
+    });
+    return { ok: true, winner: null, noSales: true };
+  }
+
+  const randomIndex = Math.floor(Math.random() * tickets.length);
+  const winningTicket = tickets[randomIndex];
+
+  await prisma.$transaction(async (tx) => {
+    await tx.winner.create({
+      data: {
+        raffleId,
+        userId: winningTicket.userId,
+        prize: raffle.prize || null,
+        status: 'pending',
+        drawDate: new Date()
+      }
+    });
+    await tx.raffle.update({
+      where: { id: raffleId },
+      data: { status: 'closed', closedAt: new Date(), style: nextStyle }
+    });
+  });
+
+  return {
+    ok: true,
+    winner: {
+      number: winningTicket.number,
+      userId: winningTicket.userId,
+      serial: winningTicket.serialNumber
+    },
+    noSales: false
+  };
+}
+
+async function autoCloseExpiredRaffle(raffleId, reason = 'time_endDate') {
+  const raffle = await prisma.raffle.findUnique({ where: { id: raffleId } });
+  if (!raffle) return { changed: false };
+
+  const status = String(raffle.status || '').toLowerCase();
+  if (status !== 'active') return { changed: false };
+
+  const endDate = getRaffleEndDate(raffle);
+  if (!endDate) return { changed: false };
+  if (endDate.getTime() > Date.now()) return { changed: false };
+
+  const result = await closeRaffleInternal(raffleId, reason);
+  return { changed: !!result.ok, result };
+}
+
+async function closeExpiredRafflesBatch(limit = 200) {
+  const safeLimit = Number.isFinite(Number(limit)) ? Math.max(1, Math.min(2000, Number(limit))) : 200;
+
+  // endDate vive en JSON (style), así que filtramos por status y parseamos en JS.
+  // Esto evita fallos por CAST si alguien guarda un endDate inválido.
+  const active = await prisma.raffle.findMany({
+    where: { status: 'active' },
+    select: { id: true, style: true, status: true },
+    orderBy: { id: 'asc' },
+    take: safeLimit
+  });
+
+  let closed = 0;
+  for (const r of active || []) {
+    const rid = Number(r?.id);
+    if (!Number.isFinite(rid)) continue;
+    const endDate = getRaffleEndDate(r);
+    if (!endDate) continue;
+    if (endDate.getTime() > Date.now()) continue;
+    const out = await autoCloseExpiredRaffle(rid, 'job_time_endDate');
+    if (out.changed) closed++;
+  }
+
+  return { scanned: (active || []).length, closed };
+}
+
 const app = express();
 
 // Diagnóstico mínimo: permite verificar rápidamente qué build/entorno está corriendo en Render.
@@ -1020,6 +1131,9 @@ app.get('/raffles/:id', async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'ID inválido' });
 
+    // Auto-cierre por tiempo (endDate) si aplica
+    await autoCloseExpiredRaffle(id, 'read_raffle_by_id');
+
     let raffle;
     let usedFallback = false;
     try {
@@ -1848,6 +1962,23 @@ app.post('/raffles', authenticateToken, authorizeRole(['admin', 'superadmin']), 
       }
     });
 
+    try {
+      await securityLogger.log({
+        action: 'RAFFLE_CREATED',
+        userEmail: String(req.user?.email || ''),
+        userId: actorId,
+        ipAddress: String(req.ip || ''),
+        userAgent: String(req.headers['user-agent'] || ''),
+        severity: 'INFO',
+        detail: `Rifa creada (draft) #${raffle.id}`,
+        entity: 'Raffle',
+        entityId: raffle.id,
+        metadata: { title: raffle.title, ticketPrice: raffle.ticketPrice, totalTickets: raffle.totalTickets }
+      });
+    } catch (_e) {
+      // no bloquear
+    }
+
     res.status(201).json({ message: 'Rifa creada (borrador)', raffle });
   } catch (error) {
     console.error(error);
@@ -2019,8 +2150,23 @@ app.post('/raffles/:id/purchase', authenticateToken, async (req, res) => {
   const qty = Number(quantity);
 
   try {
-    const raffle = await prisma.raffle.findUnique({ where: { id: Number(id) } });
+    const raffleId = Number(id);
+    const raffle = await prisma.raffle.findUnique({ where: { id: raffleId } });
     if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
+
+    // Validación de estado
+    const status = String(raffle.status || '').toLowerCase();
+    if (status !== 'active') return res.status(400).json({ error: 'La rifa no está activa' });
+
+    // Validación de cierre por tiempo
+    const endDate = getRaffleEndDate(raffle);
+    if (endDate && endDate.getTime() <= Date.now()) {
+      await autoCloseExpiredRaffle(raffleId, 'purchase_after_endDate');
+      return res.status(400).json({ error: 'La rifa ya cerró por tiempo' });
+    }
+
+    // Anti-fraude: velocidad de compra
+    await FraudEngine.checkPurchaseVelocity(userId, raffleId);
 
     const user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
@@ -2057,6 +2203,10 @@ app.post('/raffles/:id/purchase', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'No se pudieron generar números disponibles, intenta de nuevo' });
     }
 
+    // Wallet interna: debita comprador y acredita al vendedor (rifero)
+    const sellerId = raffle.userId;
+    if (!sellerId) return res.status(400).json({ error: 'Rifa sin vendedor asignado' });
+
     // Transacción
     await prisma.$transaction(async (tx) => {
       await tx.user.update({
@@ -2064,11 +2214,18 @@ app.post('/raffles/:id/purchase', authenticateToken, async (req, res) => {
         data: { balance: { decrement: totalCost } }
       });
 
+      if (sellerId !== userId) {
+        await tx.user.update({
+          where: { id: sellerId },
+          data: { balance: { increment: totalCost } }
+        });
+      }
+
       await tx.transaction.create({
         data: {
           txCode: generateTxCode(),
           userId,
-          raffleId: Number(id),
+          raffleId,
           amount: totalCost,
           type: 'purchase',
           status: 'approved',
@@ -2077,10 +2234,25 @@ app.post('/raffles/:id/purchase', authenticateToken, async (req, res) => {
         }
       });
 
+      if (sellerId !== userId) {
+        await tx.transaction.create({
+          data: {
+            txCode: generateTxCode(),
+            userId: sellerId,
+            raffleId,
+            amount: totalCost,
+            type: 'sale',
+            status: 'approved',
+            provider: 'wallet',
+            reference: encrypt(`Venta de ${qty} tickets en rifa #${id} (buyer:${userId})`)
+          }
+        });
+      }
+
       for (const num of newNumbers) {
         await tx.ticket.create({
           data: {
-            raffleId: Number(id),
+            raffleId,
             userId,
             number: num,
             status: 'approved'
@@ -2094,6 +2266,23 @@ app.post('/raffles/:id/purchase', authenticateToken, async (req, res) => {
       numbers: newNumbers,
       remainingBalance: user.balance - totalCost 
     });
+
+    try {
+      await securityLogger.log({
+        action: 'TICKETS_PURCHASED',
+        userEmail: String(req.user?.email || ''),
+        userId,
+        ipAddress: String(req.ip || ''),
+        userAgent: String(req.headers['user-agent'] || ''),
+        severity: 'INFO',
+        detail: `Compra de tickets en rifa #${id}`,
+        entity: 'Raffle',
+        entityId: String(id),
+        metadata: { quantity: qty, totalCost, raffleId: Number(id) }
+      });
+    } catch (_e) {
+      // no bloquear
+    }
 
   } catch (error) {
     console.error(error);
@@ -2879,6 +3068,24 @@ app.post('/admin/raffles/:id/activate', authenticateToken, authorizeRole(['admin
 
     if (actorRole === 'superadmin') {
       const updated = await prisma.raffle.update({ where: { id: raffleId }, data: { status: 'active', activatedAt: now } });
+
+      try {
+        await securityLogger.log({
+          action: 'RAFFLE_ACTIVATED',
+          userEmail: String(req.user?.email || ''),
+          userId: actorId,
+          ipAddress: String(req.ip || ''),
+          userAgent: String(req.headers['user-agent'] || ''),
+          severity: 'INFO',
+          detail: `Rifa activada #${raffleId}`,
+          entity: 'Raffle',
+          entityId: raffleId,
+          metadata: { role: actorRole }
+        });
+      } catch (_e) {
+        // no bloquear
+      }
+
       return res.json({ message: 'Rifa activada', raffle: updated });
     }
 
@@ -2911,6 +3118,23 @@ app.post('/admin/raffles/:id/activate', authenticateToken, authorizeRole(['admin
       }
       return tx.raffle.update({ where: { id: raffleId }, data: { status: 'active', activatedAt: now } });
     });
+
+    try {
+      await securityLogger.log({
+        action: 'RAFFLE_ACTIVATED',
+        userEmail: String(req.user?.email || ''),
+        userId: actorId,
+        ipAddress: String(req.ip || ''),
+        userAgent: String(req.headers['user-agent'] || ''),
+        severity: 'INFO',
+        detail: `Rifa activada #${raffleId}`,
+        entity: 'Raffle',
+        entityId: raffleId,
+        metadata: { role: actorRole }
+      });
+    } catch (_e) {
+      // no bloquear
+    }
 
     return res.json({ message: 'Rifa activada', raffle: updated });
   } catch (error) {
@@ -3478,56 +3702,64 @@ app.post('/raffles/:id/close', authenticateToken, authorizeRole(['admin', 'super
     if (currentStatus === 'closed') return res.status(400).json({ error: 'La rifa ya está cerrada.' });
     if (currentStatus !== 'active') return res.status(400).json({ error: 'Solo puedes cerrar rifas activas.' });
 
-    // 1. Buscar tickets vendidos
-    const tickets = await prisma.ticket.findMany({ where: { raffleId, status: 'approved' } });
-    if (tickets.length === 0) return res.status(400).json({ error: 'No hay tickets vendidos para sortear' });
+    const result = await closeRaffleInternal(raffleId, 'manual_close_endpoint');
+    if (!result.ok) return res.status(result.code || 400).json({ error: result.error || 'No se pudo cerrar' });
 
-    // 2. Elegir ganador aleatorio
-    const randomIndex = Math.floor(Math.random() * tickets.length);
-    const winningTicket = tickets[randomIndex];
-
-    // 3. Crear registro de ganador (Winner)
-    // Nota: Esto es un sorteo interno. Si es por lotería externa, el admin usa "Publicar Ganador" manualmente.
-    // Pero si usa este botón "Cerrar Rifa", asumimos que quiere que el sistema elija.
-    
-    const creatorRole = String(raffle?.user?.role || '').toLowerCase();
-    const shouldAutoDelete = creatorRole === 'admin';
-
-    if (shouldAutoDelete) {
-      await prisma.$transaction(async (tx) => {
-        await tx.ticket.deleteMany({ where: { raffleId } });
-        await tx.winner.deleteMany({ where: { raffleId } });
-        await tx.raffle.delete({ where: { id: raffleId } });
+    try {
+      await securityLogger.log({
+        action: 'RAFFLE_CLOSED',
+        userEmail: String(req.user?.email || ''),
+        userId: actorId,
+        ipAddress: String(req.ip || ''),
+        userAgent: String(req.headers['user-agent'] || ''),
+        severity: 'INFO',
+        detail: `Rifa cerrada #${raffleId}`,
+        entity: 'Raffle',
+        entityId: raffleId,
+        metadata: { noSales: !!result.noSales, winnerUserId: result.winner?.userId || null }
       });
-
-      return res.json({
-        message: 'Sorteo realizado. Esta rifa (creada por admin) fue eliminada automáticamente al finalizar.',
-        winner: {
-          number: winningTicket.number,
-          userId: winningTicket.userId,
-          serial: winningTicket.serialNumber
-        },
-        raffleDeleted: true
-      });
+    } catch (_e) {
+      // no bloquear
     }
 
-    await prisma.raffle.update({
-      where: { id: raffleId },
-      data: { status: 'closed', closedAt: new Date() }
-    });
-
     return res.json({
-      message: 'Sorteo realizado',
-      winner: {
-        number: winningTicket.number,
-        userId: winningTicket.userId,
-        serial: winningTicket.serialNumber
-      },
+      message: result.noSales ? 'Rifa cerrada (sin ventas)' : 'Sorteo realizado',
+      winner: result.winner,
       raffleDeleted: false
     });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Error al cerrar rifa' });
+  }
+});
+
+// Job protegido: cerrar rifas vencidas por endDate (útil para pruebas / cumplimiento)
+app.post('/admin/jobs/close-expired-raffles', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
+  try {
+    const limit = Number(req.body?.limit) || 200;
+    const out = await closeExpiredRafflesBatch(limit);
+
+    try {
+      await securityLogger.log({
+        action: 'RAFFLES_AUTO_CLOSED_JOB',
+        userEmail: String(req.user?.email || ''),
+        userId: Number(req.user?.userId) || null,
+        ipAddress: String(req.ip || ''),
+        userAgent: String(req.headers['user-agent'] || ''),
+        severity: 'INFO',
+        detail: 'Ejecución manual del job de cierre por endDate',
+        entity: 'Raffle',
+        entityId: null,
+        metadata: { limit, scanned: out.scanned, closed: out.closed }
+      });
+    } catch (_e) {
+      // no bloquear
+    }
+
+    return res.json({ success: true, ...out });
+  } catch (error) {
+    console.error('[close-expired-raffles] Error:', error);
+    return res.status(500).json({ error: 'Error al cerrar rifas vencidas' });
   }
 });
 
@@ -3582,6 +3814,24 @@ app.post('/wallet/topup', authenticateToken, async (req, res) => {
         }
       })
     ]);
+
+    try {
+      await securityLogger.log({
+        action: 'WALLET_TOPUP',
+        userEmail: String(req.user?.email || ''),
+        userId: Number(req.user?.userId) || null,
+        ipAddress: String(req.ip || ''),
+        userAgent: String(req.headers['user-agent'] || ''),
+        severity: 'INFO',
+        detail: 'Recarga de wallet aprobada',
+        entity: 'Transaction',
+        entityId: null,
+        metadata: { amount: Number(amount), provider: provider ? String(provider) : 'manual' }
+      });
+    } catch (_e) {
+      // no bloquear
+    }
+
     res.json({ message: 'Recarga exitosa' });
   } catch (error) {
     res.status(500).json({ error: 'Error al recargar' });
