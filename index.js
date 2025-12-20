@@ -23,8 +23,6 @@ const DEFAULT_PLAN_CONFIG = {
   starterBoostCredits: 0,
   proBoostCredits: 2,
   unlimitedBoostCredits: 8
-};
-
 let cachedPlanConfig = { value: DEFAULT_PLAN_CONFIG, loadedAt: 0 };
 async function getPlanConfig() {
   const now = Date.now();
@@ -895,7 +893,7 @@ app.get('/raffles', async (req, res) => {
         orderBy: { createdAt: 'desc' }
       });
     } catch (error) {
-      // Fallback defensivo: si el despliegue quedó con Prisma/DB desalineados,
+      // Fallback defensivo: si el despliegue queda con Prisma/DB desalineados,
       // evitamos depender del campo `status` para no romper toda la app.
       usedFallback = true;
       console.error('[GET /raffles] Primary query failed; falling back:', error);
@@ -925,7 +923,17 @@ app.get('/raffles', async (req, res) => {
     console.log('Consulta rifas:', Date.now() - start, 'ms');
     
     const decryptedRaffles = raffles.map(r => {
-      if (r.user && r.user.name) r.user.name = decrypt(r.user.name);
+      if (r.user && r.user.name) {
+        try {
+          r.user.name = decrypt(r.user.name);
+        } catch (error) {
+          console.error('[GET /raffles] decrypt(name) failed:', {
+            raffleId: r?.id,
+            userId: r?.user?.id,
+            error: error?.message || String(error)
+          });
+        }
+      }
       const base = { ...r, soldTickets: r._count?.tickets || 0 };
       if (usedFallback && base.status == null) base.status = 'active';
       return base;
