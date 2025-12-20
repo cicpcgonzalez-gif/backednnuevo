@@ -155,7 +155,7 @@ app.get('/__version', (req, res) => {
 });
 
 app.get('/__diag/routes', (req, res) => {
-  const stack = app?._router?.stack || [];
+  const stack = app?._router?.stack || app?.router?.stack || [];
   const allRoutes = stack
     .filter((layer) => layer?.route?.path)
     .map((layer) => {
