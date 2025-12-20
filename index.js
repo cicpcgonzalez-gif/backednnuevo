@@ -154,38 +154,6 @@ app.get('/__version', (req, res) => {
   });
 });
 
-app.get('/__diag/routes', (req, res) => {
-  const stack = app?._router?.stack || app?.router?.stack || [];
-  const allRoutes = stack
-    .filter((layer) => layer?.route?.path)
-    .map((layer) => {
-      const methods = Object.keys(layer.route.methods || {}).join(',');
-      return { path: layer.route.path, methods };
-    });
-
-  const techSupportRoutes = allRoutes.filter(
-    (r) => r.path === '/settings/tech-support' || r.path === '/superadmin/settings/tech-support' || String(r.path).startsWith('/settings')
-  );
-
-  const hasSettingsTechSupport = allRoutes.some((r) => r.path === '/settings/tech-support');
-  const hasSuperadminTechSupport = allRoutes.some((r) => r.path === '/superadmin/settings/tech-support');
-  const hasRaffles = allRoutes.some((r) => r.path === '/raffles');
-
-  res.json({
-    totals: {
-      topLevelRoutes: allRoutes.length
-    },
-    hasRaffles,
-    hasSettingsTechSupport,
-    hasSuperadminTechSupport,
-    sample: {
-      first: allRoutes.slice(0, 25),
-      last: allRoutes.slice(-25)
-    },
-    techSupportRoutes
-  });
-});
-
 console.log('🔒 Security Module Loaded: Encryption Enabled');
 
 // Security Middleware
