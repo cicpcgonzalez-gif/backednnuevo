@@ -23,6 +23,7 @@ const DEFAULT_PLAN_CONFIG = {
   starterBoostCredits: 0,
   proBoostCredits: 2,
   unlimitedBoostCredits: 8
+};
 let cachedPlanConfig = { value: DEFAULT_PLAN_CONFIG, loadedAt: 0 };
 async function getPlanConfig() {
   const now = Date.now();
