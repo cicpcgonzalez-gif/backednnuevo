@@ -1766,14 +1766,15 @@ app.post('/auth/2fa', async (req, res) => {
     detail: '2FA verification successful'
   });
 
-  const token = jwt.sign({ userId: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '1h' });
+  const token = signAccessToken(user);
+  const refreshToken = signRefreshToken(user);
   const { password: _, ...userWithoutPassword } = user;
 
   // Decrypt sensitive data
   if (userWithoutPassword.name) userWithoutPassword.name = decrypt(userWithoutPassword.name);
   if (userWithoutPassword.bankDetails) userWithoutPassword.bankDetails = JSON.parse(decrypt(JSON.stringify(userWithoutPassword.bankDetails)));
 
-  res.json({ message: 'Login exitoso', token, user: userWithoutPassword });
+  res.json({ message: 'Login exitoso', token, accessToken: token, refreshToken, user: userWithoutPassword });
 });
 
 // CRUD para rifas
