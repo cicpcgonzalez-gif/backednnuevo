@@ -154,6 +154,26 @@ app.get('/__version', (req, res) => {
   });
 });
 
+app.get('/__diag/routes', (req, res) => {
+  const stack = app?._router?.stack || [];
+  const routes = stack
+    .filter((layer) => layer?.route?.path)
+    .map((layer) => {
+      const methods = Object.keys(layer.route.methods || {}).join(',');
+      return { path: layer.route.path, methods };
+    })
+    .filter((r) => r.path === '/settings/tech-support' || r.path === '/superadmin/settings/tech-support' || String(r.path).startsWith('/settings'));
+
+  const hasSettingsTechSupport = routes.some((r) => r.path === '/settings/tech-support');
+  const hasSuperadminTechSupport = routes.some((r) => r.path === '/superadmin/settings/tech-support');
+
+  res.json({
+    hasSettingsTechSupport,
+    hasSuperadminTechSupport,
+    routes
+  });
+});
+
 console.log('🔒 Security Module Loaded: Encryption Enabled');
 
 // Security Middleware
