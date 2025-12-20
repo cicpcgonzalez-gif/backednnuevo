@@ -98,6 +98,15 @@ async function main() {
   if (!createRifero.ok) throw new Error(`Create rifero failed: ${createRifero.status}`);
   const riferoId = createRifero.json?.id;
 
+  // Marcar como verificado/activo para permitir login en ambientes donde se exige verificación
+  const riferoStatus = await httpJson(`/superadmin/users/${riferoId}/status`, {
+    method: 'PATCH',
+    token: superToken,
+    body: { active: true, verified: true }
+  });
+  step('set_rifero_status_verified', riferoStatus);
+  if (!riferoStatus.ok) throw new Error(`Set rifero status failed: ${riferoStatus.status}`);
+
   // 3) Asignar plan al rifero
   const plan = {
     tier: 'starter',
@@ -129,6 +138,15 @@ async function main() {
   });
   step('create_buyer_user', createBuyer);
   if (!createBuyer.ok) throw new Error(`Create buyer failed: ${createBuyer.status}`);
+
+  const buyerId = createBuyer.json?.id;
+  const buyerStatus = await httpJson(`/superadmin/users/${buyerId}/status`, {
+    method: 'PATCH',
+    token: superToken,
+    body: { active: true, verified: true }
+  });
+  step('set_buyer_status_verified', buyerStatus);
+  if (!buyerStatus.ok) throw new Error(`Set buyer status failed: ${buyerStatus.status}`);
 
   // 5) Login rifero y buyer
   const loginRifero = await httpJson('/auth/login', {
