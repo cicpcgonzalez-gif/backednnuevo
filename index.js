@@ -8,6 +8,7 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const compression = require('compression');
 const crypto = require('crypto');
+const multer = require('multer');
 const FraudEngine = require('./utils/fraudEngine');
 const paymentService = require('./services/paymentService');
 
@@ -203,10 +204,36 @@ const loginLimiter = rateLimit({
 // Inicializar Prisma
 const prisma = new PrismaClient();
 
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 15 * 1024 * 1024 // 15MB
+  }
+});
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
+
+const ACCESS_TOKEN_TTL = process.env.ACCESS_TOKEN_TTL || '1h';
+const REFRESH_TOKEN_TTL = process.env.REFRESH_TOKEN_TTL || '30d';
+
+function signAccessToken(user) {
+  return jwt.sign(
+    { userId: user.id, email: user.email, role: user.role, type: 'access' },
+    JWT_SECRET,
+    { expiresIn: ACCESS_TOKEN_TTL }
+  );
+}
+
+function signRefreshToken(user) {
+  return jwt.sign(
+    { userId: user.id, email: user.email, role: user.role, type: 'refresh' },
+    JWT_SECRET,
+    { expiresIn: REFRESH_TOKEN_TTL }
+  );
+}
 
 const generateTxCode = () => `TX-${crypto.randomBytes(10).toString('hex').toUpperCase()}`;
 
@@ -987,6 +1014,116 @@ app.get('/raffles', async (req, res) => {
   }
 });
 
+// Obtener una rifa por ID (usado por detalle en la app móvil)
+app.get('/raffles/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'ID inválido' });
+
+    let raffle;
+    let usedFallback = false;
+    try {
+      raffle = await prisma.raffle.findUnique({
+        where: { id },
+        include: {
+          user: {
+            select: {
+              id: true,
+              name: true,
+              avatar: true,
+              securityId: true,
+              identityVerified: true,
+              reputationScore: true
+            }
+          },
+          _count: { select: { tickets: true } }
+        }
+      });
+    } catch (error) {
+      usedFallback = true;
+      console.error('[GET /raffles/:id] Primary query failed; falling back:', error);
+      raffle = await prisma.raffle.findFirst({
+        where: { id },
+        select: {
+          id: true,
+          title: true,
+          prize: true,
+          totalTickets: true,
+          createdAt: true,
+          style: true,
+          user: {
+            select: {
+              id: true,
+              name: true,
+              avatar: true,
+              securityId: true,
+              identityVerified: true,
+              reputationScore: true
+            }
+          },
+          _count: { select: { tickets: true } }
+        }
+      });
+    }
+
+    if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
+
+    if (raffle.user && raffle.user.name) {
+      try {
+        raffle.user.name = decrypt(raffle.user.name);
+      } catch (error) {
+        console.error('[GET /raffles/:id] decrypt(name) failed:', {
+          raffleId: raffle?.id,
+          userId: raffle?.user?.id,
+          error: error?.message || String(error)
+        });
+      }
+    }
+
+    const base = { ...raffle, soldTickets: raffle._count?.tickets || 0 };
+    if (usedFallback && base.status == null) base.status = 'active';
+    return res.json(base);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: 'Error al obtener rifa' });
+  }
+});
+
+// Subida/procesamiento de imágenes (devuelve DataURL base64). Soporta multipart (FormData) o JSON.
+app.post(
+  '/admin/uploads/image',
+  authenticateToken,
+  authorizeRole(['admin', 'superadmin']),
+  (req, res, next) => {
+    if (req.is('multipart/form-data')) return upload.single('file')(req, res, next);
+    return next();
+  },
+  async (req, res) => {
+    try {
+      if (req.file && req.file.buffer) {
+        const mime = String(req.file.mimetype || 'image/jpeg');
+        const base64 = req.file.buffer.toString('base64');
+        return res.json({ dataUrl: `data:${mime};base64,${base64}` });
+      }
+
+      const dataUrl = req.body?.dataUrl;
+      if (typeof dataUrl === 'string' && (dataUrl.startsWith('data:') || dataUrl.startsWith('http'))) {
+        return res.json({ dataUrl });
+      }
+
+      const base64 = req.body?.base64;
+      if (typeof base64 === 'string' && base64.trim()) {
+        return res.json({ dataUrl: `data:image/jpeg;base64,${base64.trim()}` });
+      }
+
+      return res.status(400).json({ error: 'Archivo o imagen inválida' });
+    } catch (error) {
+      console.error('[POST /admin/uploads/image] error:', error);
+      return res.status(500).json({ error: 'Error al procesar imagen' });
+    }
+  }
+);
+
 // --- RAFFLE REACTIONS (LIKE/HEART) ---
 app.post('/raffles/:id/react', authenticateToken, async (req, res) => {
   try {
@@ -1477,9 +1614,32 @@ app.post('/auth/password/reset/request', async (req, res) => {
 });
 
 // Refresh token endpoint esperado por la app móvil.
-// Si no manejas refresh tokens, respondemos JSON (no HTML/404) para evitar errores.
-app.post('/auth/refresh', async (_req, res) => {
-  return res.status(501).json({ error: 'Refresh token no soportado en esta versión.' });
+app.post('/auth/refresh', async (req, res) => {
+  const { refreshToken } = req.body || {};
+  if (!refreshToken) return res.status(400).json({ error: 'refreshToken requerido' });
+
+  try {
+    const payload = jwt.verify(String(refreshToken), JWT_SECRET);
+    if (!payload || payload.type !== 'refresh' || !payload.userId) {
+      return res.status(401).json({ error: 'Refresh token inválido' });
+    }
+
+    const user = await prisma.user.findUnique({ where: { id: Number(payload.userId) } });
+    if (!user) return res.status(401).json({ error: 'Usuario no encontrado' });
+    if (!user.verified) return res.status(403).json({ error: 'Cuenta no verificada' });
+    if (user.active === false) return res.status(403).json({ error: 'Cuenta desactivada' });
+
+    const accessToken = signAccessToken(user);
+    const nextRefreshToken = signRefreshToken(user);
+
+    const { password: _pw, ...userWithoutPassword } = user;
+    if (userWithoutPassword.name) userWithoutPassword.name = decrypt(userWithoutPassword.name);
+    if (userWithoutPassword.bankDetails) userWithoutPassword.bankDetails = JSON.parse(decrypt(JSON.stringify(userWithoutPassword.bankDetails)));
+
+    return res.json({ accessToken, refreshToken: nextRefreshToken, user: userWithoutPassword });
+  } catch (error) {
+    return res.status(401).json({ error: 'Refresh token inválido o expirado' });
+  }
 });
 
 // Login de usuario
@@ -1552,7 +1712,8 @@ const handleLogin = async (req, res) => {
     detail: 'User logged in successfully'
   });
 
-  const token = jwt.sign({ userId: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '1h' });
+  const token = signAccessToken(user);
+  const refreshToken = signRefreshToken(user);
   
   // Remove password from user object before sending
   const { password: _, ...userWithoutPassword } = user;
@@ -1561,8 +1722,8 @@ const handleLogin = async (req, res) => {
   if (userWithoutPassword.name) userWithoutPassword.name = decrypt(userWithoutPassword.name);
   if (userWithoutPassword.bankDetails) userWithoutPassword.bankDetails = JSON.parse(decrypt(JSON.stringify(userWithoutPassword.bankDetails)));
 
-  // Adaptar respuesta para que coincida con lo que espera la App móvil (accessToken)
-  res.json({ message: 'Login exitoso', token, accessToken: token, user: userWithoutPassword });
+  // Adaptar respuesta para que coincida con lo que espera la App móvil (accessToken + refreshToken)
+  res.json({ message: 'Login exitoso', token, accessToken: token, refreshToken, user: userWithoutPassword });
 };
 
 app.post('/login', loginLimiter, handleLogin);
