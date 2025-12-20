@@ -142,6 +142,18 @@ function normalizePaymentMethods(value) {
 
 const app = express();
 
+// Diagnóstico mínimo: permite verificar rápidamente qué build/entorno está corriendo en Render.
+// No expone secretos (solo metadatos básicos).
+app.get('/__version', (req, res) => {
+  res.json({
+    service: 'backednnuevo',
+    commit: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || null,
+    serviceName: process.env.RENDER_SERVICE_NAME || null,
+    nodeEnv: process.env.NODE_ENV || null,
+    node: process.version
+  });
+});
+
 console.log('🔒 Security Module Loaded: Encryption Enabled');
 
 // Security Middleware
