@@ -36,6 +36,7 @@ model User {
   riskScore         Float          @default(0.0)
   isFlagged         Boolean        @default(false)
   securityId        String?        @unique
+  adminPlan         Json?
   announcements     Announcement[]
   raffles           Raffle[]       @relation("UserRaffles")
   reactions         Reaction[]
@@ -115,6 +116,9 @@ model Raffle {
   totalTickets Int      @default(10000)
   lottery      String?
   style        Json?
+  status       String   @default("active")
+  activatedAt  DateTime?
+  closedAt     DateTime?
   createdAt    DateTime @default(now())
   userId       Int?
   user         User?    @relation("UserRaffles", fields: [userId], references: [id])
