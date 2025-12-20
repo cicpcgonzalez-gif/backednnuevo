@@ -3726,6 +3726,8 @@ app.patch('/admin/reports/:id/review', authenticateToken, authorizeRole(['supera
     res.status(500).json({ error: 'Error al revisar reporte' });
   }
 
+});
+
 app.get('/superadmin/audit/actions', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
   try {
     const logs = await prisma.auditLog.findMany({ orderBy: { timestamp: 'desc' }, take: 50 });
@@ -5218,8 +5220,6 @@ app.get('/debug/test-email', async (req, res) => {
       details: err.message 
     });
   }
-});
-
 });
 
 // Start Server with DB Check and Error Handling
