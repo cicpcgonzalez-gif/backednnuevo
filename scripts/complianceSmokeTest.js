@@ -53,6 +53,19 @@ async function httpJson(pathname, { method = 'GET', body, token } = {}) {
     json = { raw: text };
   }
 
+  // Redactar tokens si vienen en la respuesta
+  try {
+    if (json && typeof json === 'object') {
+      const j = JSON.parse(JSON.stringify(json));
+      if (typeof j.token === 'string') j.token = '[REDACTED]';
+      if (typeof j.accessToken === 'string') j.accessToken = '[REDACTED]';
+      if (typeof j.refreshToken === 'string') j.refreshToken = '[REDACTED]';
+      json = j;
+    }
+  } catch {
+    // ignore
+  }
+
   return { status: res.status, ok: res.ok, json };
 }
 

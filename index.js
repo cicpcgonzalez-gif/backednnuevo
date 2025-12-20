@@ -4117,6 +4117,38 @@ app.get('/superadmin/audit/actions', authenticateToken, authorizeRole(['superadm
   }
 });
 
+// Búsqueda de auditoría (para expediente): filtra por entidad/acción/usuario y rango de fechas.
+app.get('/superadmin/audit/search', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
+  try {
+    const entity = req.query.entity ? String(req.query.entity) : null;
+    const entityId = req.query.entityId ? String(req.query.entityId) : null;
+    const action = req.query.action ? String(req.query.action) : null;
+    const userId = req.query.userId != null ? Number(req.query.userId) : null;
+    const since = req.query.since ? new Date(String(req.query.since)) : null;
+    const until = req.query.until ? new Date(String(req.query.until)) : null;
+    const limit = Math.max(1, Math.min(5000, Number(req.query.limit) || 200));
+
+    const where = {};
+    if (entity) where.entity = entity;
+    if (entityId) where.entityId = entityId;
+    if (action) where.action = action;
+    if (Number.isFinite(userId)) where.userId = userId;
+    if (since && !Number.isNaN(since.getTime())) where.timestamp = { ...(where.timestamp || {}), gte: since };
+    if (until && !Number.isNaN(until.getTime())) where.timestamp = { ...(where.timestamp || {}), lte: until };
+
+    const logs = await prisma.auditLog.findMany({
+      where,
+      orderBy: { timestamp: 'desc' },
+      take: limit
+    });
+
+    res.json({ count: logs.length, logs });
+  } catch (error) {
+    console.error('[audit/search] error:', error);
+    res.status(500).json({ error: 'Error al buscar logs' });
+  }
+});
+
 app.get('/superadmin/reports', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
   try {
     const status = String(req.query?.status || '').trim().toLowerCase();
