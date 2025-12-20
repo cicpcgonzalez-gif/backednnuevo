@@ -874,28 +874,61 @@ app.get('/users/public/:id/raffles', authenticateToken, async (req, res) => {
 app.get('/raffles', async (req, res) => {
   const start = Date.now();
   try {
-    const raffles = await prisma.raffle.findMany({
-      where: { status: 'active' },
-      include: {
-        user: {
-          select: {
-            id: true,
-            name: true,
-            avatar: true,
-            securityId: true,
-            identityVerified: true,
-            reputationScore: true
-          }
+    let raffles;
+    let usedFallback = false;
+    try {
+      raffles = await prisma.raffle.findMany({
+        where: { status: 'active' },
+        include: {
+          user: {
+            select: {
+              id: true,
+              name: true,
+              avatar: true,
+              securityId: true,
+              identityVerified: true,
+              reputationScore: true
+            }
+          },
+          _count: { select: { tickets: true } }
         },
-        _count: { select: { tickets: true } }
-      },
-      orderBy: { createdAt: 'desc' }
-    });
+        orderBy: { createdAt: 'desc' }
+      });
+    } catch (error) {
+      // Fallback defensivo: si el despliegue quedó con Prisma/DB desalineados,
+      // evitamos depender del campo `status` para no romper toda la app.
+      usedFallback = true;
+      console.error('[GET /raffles] Primary query failed; falling back:', error);
+      raffles = await prisma.raffle.findMany({
+        select: {
+          id: true,
+          title: true,
+          prize: true,
+          totalTickets: true,
+          createdAt: true,
+          style: true,
+          user: {
+            select: {
+              id: true,
+              name: true,
+              avatar: true,
+              securityId: true,
+              identityVerified: true,
+              reputationScore: true
+            }
+          },
+          _count: { select: { tickets: true } }
+        },
+        orderBy: { createdAt: 'desc' }
+      });
+    }
     console.log('Consulta rifas:', Date.now() - start, 'ms');
     
     const decryptedRaffles = raffles.map(r => {
       if (r.user && r.user.name) r.user.name = decrypt(r.user.name);
-      return { ...r, soldTickets: r._count?.tickets || 0 };
+      const base = { ...r, soldTickets: r._count?.tickets || 0 };
+      if (usedFallback && base.status == null) base.status = 'active';
+      return base;
     });
 
     // Boost ordering (rotación diaria si hay muchos unlimited)
@@ -928,6 +961,7 @@ app.get('/raffles', async (req, res) => {
 
     res.json(decryptedRaffles);
   } catch (error) {
+    console.error('[GET /raffles] Error:', error);
     res.status(500).json({ error: 'Error al obtener rifas' });
   }
 });
