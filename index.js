@@ -2331,26 +2331,51 @@ app.post('/raffles/:id/purchase', authenticateToken, async (req, res) => {
 
 app.get('/me/raffles', authenticateToken, async (req, res) => {
   try {
-    const tickets = await prisma.ticket.findMany({
-      where: { userId: req.user.userId },
-      include: {
-        raffle: {
-          include: {
-            user: {
-              select: {
-                id: true,
-                name: true,
-                avatar: true,
-                securityId: true,
-                identityVerified: true,
-                isBoosted: true,
-                boostEndsAt: true
+    let tickets;
+    try {
+      tickets = await prisma.ticket.findMany({
+        where: { userId: req.user.userId },
+        include: {
+          raffle: {
+            include: {
+              user: {
+                select: {
+                  id: true,
+                  name: true,
+                  avatar: true,
+                  securityId: true,
+                  identityVerified: true,
+                  isBoosted: true,
+                  boostEndsAt: true
+                }
               }
             }
           }
         }
-      }
-    });
+      });
+    } catch (error) {
+      // Compatibilidad: algunas DBs/migraciones pueden no tener columnas nuevas todavía.
+      // Reintenta con un select mínimo para evitar 500 en la app.
+      console.error('[GET /me/raffles] Primary query failed; falling back:', error);
+      tickets = await prisma.ticket.findMany({
+        where: { userId: req.user.userId },
+        include: {
+          raffle: {
+            include: {
+              user: {
+                select: {
+                  id: true,
+                  name: true,
+                  avatar: true,
+                  securityId: true,
+                  identityVerified: true
+                }
+              }
+            }
+          }
+        }
+      });
+    }
     
     const raffleIds = Array.from(new Set((tickets || []).map((t) => t.raffleId).filter(Boolean)));
     const purchases = raffleIds.length
