@@ -3635,45 +3635,6 @@ app.get('/winners', async (req, res) => {
 
 // --- ADMIN ANNOUNCEMENTS ---
 
-app.post('/admin/announcements', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
-  const { title, content, imageUrl } = req.body;
-  
-  if (!title || !content) {
-    return res.status(400).json({ error: 'Título y contenido requeridos' });
-  }
-
-  try {
-    const announcement = await prisma.announcement.create({
-      data: {
-        title,
-        content,
-        imageUrl,
-        adminId: req.user.userId
-      }
-    });
-    
-    // Opcional: Enviar push notification automática
-    // sendPushToAll(title, content);
-
-    res.json({ message: 'Anuncio publicado', announcement });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Error al crear anuncio' });
-  }
-});
-
-app.get('/announcements', async (req, res) => {
-  try {
-    const news = await prisma.announcement.findMany({
-      orderBy: { createdAt: 'desc' },
-      take: 20,
-      include: { admin: { select: { name: true } } }
-    });
-    res.json(news);
-  } catch (error) {
-    res.status(500).json({ error: 'Error al obtener noticias' });
-  }
-});
 
 // --- ADMIN PUSH NOTIFICATIONS ---
 
@@ -5243,7 +5204,10 @@ app.get('/announcements', async (req, res) => {
       const annId = g.announcementId;
       if (!countsMap.has(annId)) countsMap.set(annId, { LIKE: 0, HEART: 0, DISLIKE: 0 });
       const entry = countsMap.get(annId);
-      entry[g.type] = g._count?._all || 0;
+      const key = String(g.type || '').toUpperCase();
+      if (key === 'LIKE' || key === 'HEART' || key === 'DISLIKE') {
+        entry[key] = g._count?._all || 0;
+      }
     }
 
     const decryptedAnnouncements = announcements.map(a => {
@@ -5378,7 +5342,7 @@ app.post('/admin/announcements', authenticateToken, authorizeRole(['admin', 'sup
 app.post('/announcements/:id/react', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
-    const { type } = req.body; 
+    const type = String(req.body?.type || '').toUpperCase();
     
     if (!['LIKE', 'HEART', 'DISLIKE'].includes(type)) {
       return res.status(400).json({ error: 'Tipo de reacción inválido' });
@@ -5394,7 +5358,8 @@ app.post('/announcements/:id/react', authenticateToken, async (req, res) => {
     });
 
     if (existing) {
-      if (existing.type === type) {
+      const existingType = String(existing.type || '').toUpperCase();
+      if (existingType === type) {
         await prisma.reaction.delete({ where: { id: existing.id } });
         return res.json({ message: 'Reacción eliminada', active: false });
       } else {
