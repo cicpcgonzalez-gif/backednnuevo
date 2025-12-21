@@ -3428,16 +3428,35 @@ app.get('/admin/tickets', authenticateToken, authorizeRole(['admin', 'superadmin
 // --- ADMIN METRICS ---
 app.get('/admin/metrics/summary', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
   try {
+    const raffleIdRaw = req.query?.raffleId;
+    const raffleIdNum = raffleIdRaw !== undefined && raffleIdRaw !== null && raffleIdRaw !== '' ? Number(raffleIdRaw) : null;
+    if (raffleIdNum !== null && (!Number.isFinite(raffleIdNum) || raffleIdNum <= 0)) {
+      return res.status(400).json({ error: 'raffleId inválido' });
+    }
+
     const startOfDay = new Date();
     startOfDay.setHours(0, 0, 0, 0);
 
-    const tickets = await prisma.ticket.findMany({ include: { raffle: { select: { ticketPrice: true } } } });
+    const ticketWhere = {};
+    if (raffleIdNum) ticketWhere.raffleId = raffleIdNum;
+
+    const tickets = await prisma.ticket.findMany({
+      where: ticketWhere,
+      select: {
+        createdAt: true,
+        userId: true,
+        raffle: { select: { ticketPrice: true } }
+      }
+    });
     const todayTickets = tickets.filter((t) => t.createdAt >= startOfDay);
     const ticketsSold = tickets.length;
     const participants = new Set(tickets.map((t) => t.userId)).size;
     const totalRevenue = tickets.reduce((acc, t) => acc + (t.raffle?.ticketPrice || 0), 0);
     const todayRevenue = todayTickets.reduce((acc, t) => acc + (t.raffle?.ticketPrice || 0), 0);
-    const pendingPayments = await prisma.transaction.count({ where: { status: 'pending' } });
+
+    const pendingWhere = { status: 'pending' };
+    if (raffleIdNum) pendingWhere.raffleId = raffleIdNum;
+    const pendingPayments = await prisma.transaction.count({ where: pendingWhere });
 
     res.json({
       ticketsSold,
@@ -3478,12 +3497,21 @@ app.get('/admin/metrics/hourly', authenticateToken, authorizeRole(['admin', 'sup
 app.get('/admin/metrics/daily', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
   try {
     const days = Number(req.query.days) || 7;
+    const raffleIdRaw = req.query?.raffleId;
+    const raffleIdNum = raffleIdRaw !== undefined && raffleIdRaw !== null && raffleIdRaw !== '' ? Number(raffleIdRaw) : null;
+    if (raffleIdNum !== null && (!Number.isFinite(raffleIdNum) || raffleIdNum <= 0)) {
+      return res.status(400).json({ error: 'raffleId inválido' });
+    }
+
     const since = new Date();
     since.setHours(0, 0, 0, 0);
     since.setDate(since.getDate() - (days - 1));
 
     const tickets = await prisma.ticket.findMany({
-      where: { createdAt: { gte: since } },
+      where: {
+        createdAt: { gte: since },
+        ...(raffleIdNum ? { raffleId: raffleIdNum } : {})
+      },
       select: { createdAt: true, raffleId: true }
     });
 
@@ -3508,7 +3536,14 @@ app.get('/admin/metrics/daily', authenticateToken, authorizeRole(['admin', 'supe
 
 app.get('/admin/metrics/by-state', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
   try {
+    const raffleIdRaw = req.query?.raffleId;
+    const raffleIdNum = raffleIdRaw !== undefined && raffleIdRaw !== null && raffleIdRaw !== '' ? Number(raffleIdRaw) : null;
+    if (raffleIdNum !== null && (!Number.isFinite(raffleIdNum) || raffleIdNum <= 0)) {
+      return res.status(400).json({ error: 'raffleId inválido' });
+    }
+
     const tickets = await prisma.ticket.findMany({
+      where: raffleIdNum ? { raffleId: raffleIdNum } : undefined,
       select: {
         user: { select: { state: true } }
       }
@@ -3530,8 +3565,15 @@ app.get('/admin/metrics/by-state', authenticateToken, authorizeRole(['admin', 's
 
 app.get('/admin/metrics/top-buyers', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
   try {
+    const raffleIdRaw = req.query?.raffleId;
+    const raffleIdNum = raffleIdRaw !== undefined && raffleIdRaw !== null && raffleIdRaw !== '' ? Number(raffleIdRaw) : null;
+    if (raffleIdNum !== null && (!Number.isFinite(raffleIdNum) || raffleIdNum <= 0)) {
+      return res.status(400).json({ error: 'raffleId inválido' });
+    }
+
     const buyers = await prisma.ticket.groupBy({
       by: ['userId'],
+      where: raffleIdNum ? { raffleId: raffleIdNum } : undefined,
       _count: { userId: true },
       orderBy: { _count: { userId: 'desc' } },
       take: 10
