@@ -63,6 +63,10 @@ async function main() {
     checks: {}
   };
 
+  // 0) Estado SANDBOX (público)
+  const sandboxStatus = await httpJson('/sandbox/status');
+  pack.checks.sandboxStatus = sandboxStatus;
+
   // Login superadmin
   const login = await httpJson('/auth/login', {
     method: 'POST',

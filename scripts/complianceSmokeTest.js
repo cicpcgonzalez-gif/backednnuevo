@@ -83,6 +83,10 @@ async function main() {
 
   const step = (name, data) => evidence.steps.push({ name, at: nowIso(), ...data });
 
+  // 0) Estado SANDBOX (público)
+  const sandboxStatus = await httpJson('/sandbox/status');
+  step('sandbox_status', sandboxStatus);
+
   // 1) Login superadmin
   const loginSuper = await httpJson('/auth/login', {
     method: 'POST',

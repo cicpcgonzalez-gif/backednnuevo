@@ -12,6 +12,10 @@ const multer = require('multer');
 const FraudEngine = require('./utils/fraudEngine');
 const paymentService = require('./services/paymentService');
 
+// --- SANDBOX MODE (simulación total, sin dinero real) ---
+const SANDBOX_MODE = String(process.env.SANDBOX_MODE || '').toLowerCase() === 'true';
+const SANDBOX_LABEL = ' [SIMULADO]';
+
 // --- Admin Plans (subscription/quotas) ---
 
 const DEFAULT_PLAN_CONFIG = {
@@ -266,6 +270,21 @@ app.get('/__version', (req, res) => {
   });
 });
 
+// Endpoint público: confirma si el backend está en modo sandbox.
+app.get('/sandbox/status', (req, res) => {
+  res.json({
+    sandbox: SANDBOX_MODE,
+    payments: {
+      initiateProviderForced: SANDBOX_MODE,
+      webhooksEnabled: !SANDBOX_MODE
+    },
+    email: {
+      suppressedByDefault: SANDBOX_MODE && String(process.env.SANDBOX_ALLOW_EMAIL || '').toLowerCase() !== 'true'
+    },
+    timestamp: Date.now()
+  });
+});
+
 console.log('🔒 Security Module Loaded: Encryption Enabled');
 
 // Security Middleware
@@ -495,6 +514,21 @@ async function sendEmail(to, subject, text, html, options = {}) {
   try {
     const attachments = Array.isArray(options?.attachments) ? options.attachments : undefined;
     const forceSmtp = options?.forceSmtp === true || (attachments && attachments.length > 0);
+
+    // En SANDBOX, suprimimos envíos por defecto para evitar contacto real accidental.
+    // Se puede habilitar explícitamente con SANDBOX_ALLOW_EMAIL=true.
+    const sandboxAllowEmail = String(process.env.SANDBOX_ALLOW_EMAIL || '').toLowerCase() === 'true';
+    if (SANDBOX_MODE && !sandboxAllowEmail) {
+      console.log(`[SANDBOX EMAIL SUPPRESSED] To: ${to} | Subject: ${subject}`);
+      try {
+        await prisma.mailLog.create({
+          data: { to, subject, status: 'SENT_SANDBOX_SUPPRESSED', timestamp: new Date() }
+        });
+      } catch (_e) {
+        // no bloquear
+      }
+      return true;
+    }
 
     // 1. Buscar configuración SMTP personalizada en DB
     let settings = null;
@@ -2115,10 +2149,13 @@ app.get('/raffles/:id/payment-details', authenticateToken, async (req, res) => {
     const paymentMethods = normalizePaymentMethods(style.paymentMethods);
     const seller = raffle.user || null;
 
+    const bankDetails = SANDBOX_MODE ? null : (seller?.bankDetails || null);
     return res.json({
       raffle: { id: raffle.id, title: raffle.title },
       paymentMethods,
-      bankDetails: seller?.bankDetails || null,
+      bankDetails,
+      sandbox: SANDBOX_MODE,
+      notice: SANDBOX_MODE ? 'SANDBOX: pagos reales deshabilitados' : null,
       seller: seller
         ? {
             id: seller.id,
@@ -2221,6 +2258,8 @@ app.post('/raffles/:id/purchase', authenticateToken, async (req, res) => {
         });
       }
 
+      const txProvider = SANDBOX_MODE ? 'sandbox' : 'wallet';
+
       await tx.transaction.create({
         data: {
           txCode: generateTxCode(),
@@ -2229,8 +2268,8 @@ app.post('/raffles/:id/purchase', authenticateToken, async (req, res) => {
           amount: totalCost,
           type: 'purchase',
           status: 'approved',
-          provider: 'wallet',
-          reference: `Compra de ${qty} tickets en rifa #${id}`
+          provider: txProvider,
+          reference: `Compra de ${qty} tickets en rifa #${id}${SANDBOX_MODE ? SANDBOX_LABEL : ''}`
         }
       });
 
@@ -2243,8 +2282,8 @@ app.post('/raffles/:id/purchase', authenticateToken, async (req, res) => {
             amount: totalCost,
             type: 'sale',
             status: 'approved',
-            provider: 'wallet',
-            reference: encrypt(`Venta de ${qty} tickets en rifa #${id} (buyer:${userId})`)
+            provider: txProvider,
+            reference: encrypt(`Venta de ${qty} tickets en rifa #${id} (buyer:${userId})${SANDBOX_MODE ? SANDBOX_LABEL : ''}`)
           }
         });
       }
@@ -2278,7 +2317,7 @@ app.post('/raffles/:id/purchase', authenticateToken, async (req, res) => {
         detail: `Compra de tickets en rifa #${id}`,
         entity: 'Raffle',
         entityId: String(id),
-        metadata: { quantity: qty, totalCost, raffleId: Number(id) }
+        metadata: { quantity: qty, totalCost, raffleId: Number(id), sandbox: SANDBOX_MODE }
       });
     } catch (_e) {
       // no bloquear
@@ -2457,12 +2496,36 @@ const securityLogger = require('./services/securityLogger');
 
 // Initiate a payment
 app.post('/payments/initiate', authenticateToken, async (req, res) => {
-  const { amount, currency, provider, type, raffleId } = req.body;
+  const { amount, currency, provider, type, raffleId } = req.body || {};
   const userId = req.user.userId;
 
   try {
-    const result = await paymentService.initiateTransaction(userId, parseFloat(amount), currency, provider, type, raffleId);
-    res.json(result);
+    const parsedAmount = Number(amount);
+    if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
+      return res.status(400).json({ error: 'Monto inválido' });
+    }
+
+    const safeCurrency = currency ? String(currency).toUpperCase() : 'VES';
+    const safeType = type ? String(type) : 'deposit';
+    const requestedProvider = provider ? String(provider).toLowerCase() : 'manual';
+    const safeProvider = SANDBOX_MODE ? 'sandbox' : requestedProvider;
+    const safeRaffleId = raffleId == null || raffleId === '' ? null : Number(raffleId);
+
+    const result = await paymentService.initiateTransaction(
+      userId,
+      parsedAmount,
+      safeCurrency,
+      safeProvider,
+      safeType,
+      Number.isFinite(safeRaffleId) ? safeRaffleId : null
+    );
+
+    res.json({
+      ...result,
+      sandbox: SANDBOX_MODE,
+      providerRequested: requestedProvider,
+      providerUsed: safeProvider
+    });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Error initiating payment' });
@@ -2471,6 +2534,9 @@ app.post('/payments/initiate', authenticateToken, async (req, res) => {
 
 // Webhook for payment providers
 app.post('/payments/webhook/:provider', async (req, res) => {
+  if (SANDBOX_MODE) {
+    return res.status(403).json({ error: 'Webhooks deshabilitados en SANDBOX' });
+  }
   const { provider } = req.params;
   const data = req.body;
 
@@ -2509,7 +2575,8 @@ app.post('/tickets', authenticateToken, async (req, res) => {
           amount: -raffle.ticketPrice,
           type: 'manual_payment',
           status: 'pending',
-          reference: encrypt(`Compra Rifa: ${raffle.title}`),
+          provider: SANDBOX_MODE ? 'sandbox' : 'manual',
+          reference: encrypt(`Compra Rifa: ${raffle.title}${SANDBOX_MODE ? SANDBOX_LABEL : ''}`),
           proof: encrypt(proof),
           raffleId: Number(raffleId)
         }
@@ -2580,7 +2647,8 @@ app.post('/tickets', authenticateToken, async (req, res) => {
             amount: -raffle.ticketPrice,
             type: 'purchase',
             status: 'approved',
-            reference: encrypt(`Ticket #${assignedNumber} - ${raffle.title}`)
+            provider: SANDBOX_MODE ? 'sandbox' : 'wallet',
+            reference: encrypt(`Ticket #${assignedNumber} - ${raffle.title}${SANDBOX_MODE ? SANDBOX_LABEL : ''}`)
           }
         });
       }
@@ -3022,10 +3090,14 @@ app.put('/admin/bank-details', authenticateToken, authorizeRole(['admin', 'super
 // Endpoint público para ver datos bancarios del admin (para que el usuario pague)
 app.get('/admin/bank-details', async (req, res) => {
   try {
+    if (SANDBOX_MODE) {
+      return res.json({ bankDetails: null, sandbox: true, notice: 'SANDBOX: datos bancarios ocultos' });
+    }
     // Asumimos que el admin principal es el ID 1 o buscamos por rol
     const admin = await prisma.user.findFirst({ where: { role: 'superadmin' } });
     if (!admin || !admin.bankDetails) return res.status(404).json({ error: 'Datos bancarios no disponibles' });
-    res.json(admin.bankDetails);
+    const safe = admin.bankDetails && typeof admin.bankDetails === 'object' ? admin.bankDetails : {};
+    res.json({ ...safe, sandbox: false });
   } catch (error) {
     res.status(500).json({ error: 'Error al obtener datos bancarios' });
   }
@@ -3716,7 +3788,7 @@ app.post('/raffles/:id/close', authenticateToken, authorizeRole(['admin', 'super
         detail: `Rifa cerrada #${raffleId}`,
         entity: 'Raffle',
         entityId: raffleId,
-        metadata: { noSales: !!result.noSales, winnerUserId: result.winner?.userId || null }
+        metadata: { noSales: !!result.noSales, winnerUserId: result.winner?.userId || null, sandbox: SANDBOX_MODE }
       });
     } catch (_e) {
       // no bloquear
@@ -3750,7 +3822,7 @@ app.post('/admin/jobs/close-expired-raffles', authenticateToken, authorizeRole([
         detail: 'Ejecución manual del job de cierre por endDate',
         entity: 'Raffle',
         entityId: null,
-        metadata: { limit, scanned: out.scanned, closed: out.closed }
+        metadata: { limit, scanned: out.scanned, closed: out.closed, sandbox: SANDBOX_MODE }
       });
     } catch (_e) {
       // no bloquear
@@ -3764,19 +3836,6 @@ app.post('/admin/jobs/close-expired-raffles', authenticateToken, authorizeRole([
 });
 
 // --- SUPERADMIN ENDPOINTS ---
-
-app.get('/admin/bank-details', authenticateToken, async (req, res) => {
-  try {
-    // Asumimos que el primer superadmin o admin tiene los datos
-    const admin = await prisma.user.findFirst({
-      where: { role: { in: ['admin', 'superadmin'] }, bankDetails: { not: Prisma.DbNull } }
-    });
-    if (!admin || !admin.bankDetails) return res.json({ bankDetails: null });
-    res.json({ bankDetails: admin.bankDetails });
-  } catch (error) {
-    res.status(500).json({ error: 'Error al obtener datos bancarios' });
-  }
-});
 
 // --- WALLET ENDPOINTS ---
 
@@ -3796,6 +3855,12 @@ app.post('/wallet/topup', authenticateToken, async (req, res) => {
   const { amount, provider } = req.body;
   if (!amount || amount <= 0) return res.status(400).json({ error: 'Monto inválido' });
 
+  const requestedProvider = provider ? String(provider) : 'manual';
+  const txProvider = SANDBOX_MODE ? 'sandbox' : requestedProvider;
+  const ref = SANDBOX_MODE
+    ? `Recarga de saldo${SANDBOX_LABEL} (${requestedProvider})`
+    : 'Recarga de saldo';
+
   try {
     await prisma.$transaction([
       prisma.user.update({
@@ -3809,8 +3874,8 @@ app.post('/wallet/topup', authenticateToken, async (req, res) => {
           amount: Number(amount),
           type: 'deposit',
           status: 'approved',
-          provider: provider ? String(provider) : 'manual',
-          reference: encrypt('Recarga de saldo')
+          provider: txProvider,
+          reference: encrypt(ref)
         }
       })
     ]);
@@ -3826,7 +3891,7 @@ app.post('/wallet/topup', authenticateToken, async (req, res) => {
         detail: 'Recarga de wallet aprobada',
         entity: 'Transaction',
         entityId: null,
-        metadata: { amount: Number(amount), provider: provider ? String(provider) : 'manual' }
+        metadata: { amount: Number(amount), providerRequested: requestedProvider, providerUsed: txProvider, sandbox: SANDBOX_MODE }
       });
     } catch (_e) {
       // no bloquear

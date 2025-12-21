@@ -15,9 +15,26 @@ Este documento describe cómo generar evidencia reproducible de pruebas end‑to
 
 ## Requisitos
 - Backend en Render accesible (ej: `https://backednnuevo.onrender.com`).
+- (Recomendado para pruebas sin riesgo) Backend en **SANDBOX MODE**.
 - Credenciales de superadmin (se crean/aseguran al iniciar):
   - Email: `rifa@megarifasapp.com`
   - Password: `rifasadmin123`
+
+## SANDBOX MODE (simulación total)
+Para que la plataforma “funcione como real” pero sin riesgo de pagos/dinero real:
+- Define `SANDBOX_MODE=true`.
+- Verifica el estado con:
+  - `GET /sandbox/status`
+
+Comportamiento en SANDBOX:
+- `POST /payments/webhook/*` se bloquea (403).
+- `POST /payments/initiate` fuerza `providerUsed=sandbox`.
+- Las transacciones (recarga/compra) quedan marcadas con `provider=sandbox` y referencias con `[SIMULADO]`.
+- Se ocultan datos bancarios en:
+  - `GET /admin/bank-details`
+  - `GET /raffles/:id/payment-details`
+- Emails se suprimen por defecto (se registran como `SENT_SANDBOX_SUPPRESSED`).
+  - Si necesitas enviar correos en pruebas controladas: `SANDBOX_ALLOW_EMAIL=true`.
 
 ## Generación de evidencia (automática)
 ### A) Smoke test (crea todo y cierra por tiempo)
@@ -47,6 +64,8 @@ Evidencia:
 - Se guarda en `artifacts/compliance-pack-raffle-<ID>-*.json`.
 
 ## Endpoints relevantes
+- Estado sandbox:
+  - `GET /sandbox/status`
 - Cierre por tiempo (manual/job):
   - `POST /admin/jobs/close-expired-raffles` (requiere superadmin)
 - Auditoría:
