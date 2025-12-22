@@ -3098,6 +3098,217 @@ app.get('/admin/verify-ticket/:query', authenticateToken, authorizeRole(['admin'
   }
 });
 
+// --- TICKETS VERIFICATION (RIFA ESPECÍFICA, 1 DATO) ---
+// Reglas:
+// - Siempre requiere raffleId
+// - Admin: solo puede verificar sus rifas ACTIVAS
+// - Superadmin: puede verificar rifas activas de cualquier admin
+// - Debe funcionar con 1 solo dato: cedula | name | number | serial
+app.get('/admin/tickets/verify', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const actorRole = String(req.user?.role || '').toLowerCase();
+    const actorId = req.user?.userId;
+
+    const raffleIdRaw = String(req.query.raffleId || '').trim();
+    const raffleId = Number(raffleIdRaw);
+    if (!raffleId || !Number.isFinite(raffleId)) {
+      return res.status(400).json({ valid: false, error: 'raffleId requerido' });
+    }
+
+    const serialRaw = String(req.query.serial || '').trim();
+    const numberRaw = String(req.query.number || '').trim();
+    const cedulaRaw = String(req.query.cedula || '').trim();
+    const nameRaw = String(req.query.name || '').trim();
+    const take = Math.min(Math.max(Number(req.query.take) || 20, 1), 50);
+
+    const normalizeDigits = (value) => String(value || '').replace(/\D/g, '');
+    const normalizeName = (value) => String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+
+    const serial = serialRaw;
+    const numberDigits = normalizeDigits(numberRaw);
+    const cedulaDigits = normalizeDigits(cedulaRaw);
+    const nameQ = normalizeName(nameRaw);
+
+    const hasAny = Boolean(serial || numberDigits || cedulaDigits || nameQ);
+    if (!hasAny) {
+      return res.status(400).json({ valid: false, error: 'Debes enviar serial, number, cedula o name' });
+    }
+
+    // Validar acceso a rifa y que sea activa
+    const raffle = await prisma.raffle.findUnique({
+      where: { id: raffleId },
+      select: {
+        id: true,
+        title: true,
+        description: true,
+        digits: true,
+        price: true,
+        status: true,
+        userId: true,
+        user: { select: { id: true, publicId: true, name: true, email: true, avatar: true, securityId: true } }
+      }
+    });
+    if (!raffle) return res.status(404).json({ valid: false, error: 'Rifa no encontrada' });
+    if (String(raffle.status || '').toLowerCase() !== 'active') {
+      return res.status(403).json({ valid: false, error: 'Solo se puede verificar en rifas activas' });
+    }
+    if (actorRole !== 'superadmin' && raffle.userId !== actorId) {
+      return res.status(403).json({ valid: false, error: 'No puedes verificar tickets de rifas de otros admins' });
+    }
+
+    // Búsqueda por campos no encriptados (serial/number) directo; para nombre/cédula se filtra en memoria.
+    let candidates = [];
+    if (serial) {
+      const found = await prisma.ticket.findFirst({
+        where: { raffleId, serialNumber: serial },
+        include: { user: { select: { id: true, publicId: true, name: true, email: true, phone: true, cedula: true } } }
+      });
+      candidates = found ? [found] : [];
+    } else if (numberDigits) {
+      const found = await prisma.ticket.findFirst({
+        where: { raffleId, number: Number(numberDigits) },
+        include: { user: { select: { id: true, publicId: true, name: true, email: true, phone: true, cedula: true } } }
+      });
+      candidates = found ? [found] : [];
+    } else {
+      // Escaneo paginado para poder comparar contra campos encriptados
+      const pageSize = 250;
+      const maxScan = 5000;
+      let skip = 0;
+      let scanned = 0;
+      const matches = [];
+
+      while (matches.length < take && scanned < maxScan) {
+        const page = await prisma.ticket.findMany({
+          where: { raffleId },
+          include: { user: { select: { id: true, publicId: true, name: true, email: true, phone: true, cedula: true } } },
+          orderBy: { createdAt: 'desc' },
+          skip,
+          take: pageSize
+        });
+        if (!page.length) break;
+        scanned += page.length;
+        skip += page.length;
+
+        for (const t of page) {
+          const u = t.user || {};
+          const buyerName = u.name ? safeDecrypt(u.name) : '';
+          const buyerCedula = u.cedula ? safeDecrypt(u.cedula) : '';
+
+          const okCedula = cedulaDigits ? normalizeDigits(buyerCedula) === cedulaDigits : true;
+          const okName = nameQ ? normalizeName(buyerName).includes(nameQ) : true;
+          if (okCedula && okName) {
+            matches.push(t);
+            if (matches.length >= take) break;
+          }
+        }
+      }
+
+      candidates = matches;
+    }
+
+    if (!candidates.length) {
+      return res.status(404).json({ valid: false, error: 'Sin coincidencias' });
+    }
+
+    const seller = raffle.user || {};
+    const sellerName = seller.name ? safeDecrypt(seller.name) : null;
+    const sellerSecurityIdLast8 = seller.securityId ? String(seller.securityId).slice(-8).toUpperCase() : null;
+
+    const mapped = candidates.map((t) => {
+      const u = t.user || {};
+      return {
+        id: t.id,
+        serialNumber: t.serialNumber,
+        number: t.number,
+        status: t.status,
+        createdAt: t.createdAt,
+        receiptSignature: t.receiptSignature,
+        raffle: {
+          id: raffle.id,
+          title: raffle.title,
+          description: raffle.description,
+          digits: raffle.digits,
+          price: raffle.price
+        },
+        seller: {
+          id: seller.id,
+          publicId: seller.publicId,
+          name: sellerName,
+          email: seller.email,
+          avatar: seller.avatar,
+          securityIdLast8: sellerSecurityIdLast8
+        },
+        buyer: {
+          id: u.id,
+          publicId: u.publicId,
+          name: u.name ? safeDecrypt(u.name) : null,
+          email: u.email,
+          phone: u.phone ? safeDecrypt(u.phone) : null,
+          cedula: u.cedula ? safeDecrypt(u.cedula) : null
+        }
+      };
+    });
+
+    return res.json({ valid: true, matches: mapped, count: mapped.length, verifiedAt: new Date() });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ valid: false, error: 'Error de verificación' });
+  }
+});
+
+// Superadmin: lista de admins con rifas activas (para selección en verificador)
+app.get('/superadmin/admins/active-raffles', authenticateToken, authorizeRole(['superadmin']), async (_req, res) => {
+  try {
+    const raffles = await prisma.raffle.findMany({
+      where: { status: 'active' },
+      select: {
+        id: true,
+        title: true,
+        createdAt: true,
+        activatedAt: true,
+        userId: true,
+        user: { select: { id: true, publicId: true, name: true, email: true, avatar: true } }
+      },
+      orderBy: { activatedAt: 'desc' }
+    });
+
+    const byAdmin = new Map();
+    for (const r of raffles) {
+      const u = r.user || {};
+      const key = u.id;
+      if (!key) continue;
+      if (!byAdmin.has(key)) {
+        byAdmin.set(key, {
+          id: u.id,
+          publicId: u.publicId,
+          name: u.name ? safeDecrypt(u.name) : null,
+          email: u.email,
+          avatar: u.avatar,
+          activeRaffles: []
+        });
+      }
+      byAdmin.get(key).activeRaffles.push({
+        id: r.id,
+        title: r.title,
+        createdAt: r.createdAt,
+        activatedAt: r.activatedAt
+      });
+    }
+
+    const list = Array.from(byAdmin.values()).sort((a, b) => {
+      const at = a.activeRaffles?.[0]?.activatedAt || a.activeRaffles?.[0]?.createdAt;
+      const bt = b.activeRaffles?.[0]?.activatedAt || b.activeRaffles?.[0]?.createdAt;
+      return new Date(bt || 0).getTime() - new Date(at || 0).getTime();
+    });
+
+    return res.json(list);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: 'Error al obtener admins con rifas activas' });
+  }
+});
+
 // Endpoint para guardar datos bancarios del admin
 app.put('/admin/bank-details', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
   const { bankDetails } = req.body;
