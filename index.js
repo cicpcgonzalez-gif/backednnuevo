@@ -5551,6 +5551,56 @@ app.post('/superadmin/users/delete-by-email', authenticateToken, authorizeRole([
   }
 });
 
+// Superadmin: resetear contraseña por email (para soporte).
+// Nota: requiere token superadmin. No devuelve la contraseña.
+app.post('/superadmin/users/reset-password-by-email', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    const newPassword = String(req.body?.newPassword || '').trim();
+    if (!email || !email.includes('@')) return res.status(400).json({ error: 'Email inválido' });
+    if (!newPassword || newPassword.length < 6) {
+      return res.status(400).json({ error: 'Contraseña inválida (mínimo 6 caracteres)' });
+    }
+
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+    if (user.role === 'superadmin') return res.status(403).json({ error: 'No se puede resetear contraseña de superadmin por este endpoint' });
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    const updated = await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        password: hashedPassword,
+        verificationToken: null,
+        // Evitar bloqueos en login
+        active: true,
+        verified: true
+      }
+    });
+
+    try {
+      await prisma.auditLog.create({
+        data: {
+          action: 'SUPERADMIN_RESET_PASSWORD_BY_EMAIL',
+          userId: req.user?.userId,
+          userEmail: req.user?.email,
+          entity: 'User',
+          entityId: String(user.id),
+          detail: `Reset password by email: ${email}`,
+          ipAddress: String(req.ip || ''),
+          userAgent: String(req.headers['user-agent'] || ''),
+          severity: 'CRITICAL'
+        }
+      });
+    } catch (_e) {}
+
+    return res.json({ ok: true, message: 'Contraseña actualizada', user: redactUserForResponse(updated) });
+  } catch (error) {
+    console.error('[SUPERADMIN][reset-password-by-email] error:', error);
+    return res.status(500).json({ error: 'Error al resetear contraseña' });
+  }
+});
+
 app.patch('/superadmin/users/:id/status', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
   const { id } = req.params;
   const { active, verified } = req.body;
