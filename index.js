@@ -76,6 +76,18 @@ async function ensureDbColumns() {
 
     await prisma.$executeRawUnsafe('UPDATE "Raffle" SET "status"=\'active\' WHERE "status" IS NULL;');
     await prisma.$executeRawUnsafe('UPDATE "Raffle" SET "activatedAt"="createdAt" WHERE "activatedAt" IS NULL AND "status"=\'active\';');
+
+    // Winner columns (para múltiples premios por rifa: 1pm/4pm/10pm)
+    // Nota: se hace por compatibilidad cuando Render queda desalineado con migraciones.
+    try {
+      await prisma.$executeRawUnsafe('ALTER TABLE "Winner" ADD COLUMN IF NOT EXISTS "drawSlot" TEXT;');
+      await prisma.$executeRawUnsafe('ALTER TABLE "Winner" ADD COLUMN IF NOT EXISTS "ticketNumber" INTEGER;');
+      await prisma.$executeRawUnsafe('ALTER TABLE "Winner" ADD COLUMN IF NOT EXISTS "status" TEXT NOT NULL DEFAULT \'pending\';');
+      try { await prisma.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS "Winner_raffleId_drawSlot_idx" ON "Winner"("raffleId", "drawSlot");'); } catch (_e) {}
+      try { await prisma.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS "Winner_raffleId_ticketNumber_idx" ON "Winner"("raffleId", "ticketNumber");'); } catch (_e) {}
+    } catch (e) {
+      console.error('[DB] ensureDbColumns Winner failed:', e?.message || e);
+    }
   } catch (e) {
     console.error('[DB] ensureDbColumns adminPlan failed:', e?.message || e);
   }
@@ -163,6 +175,73 @@ function getRaffleEndDate(raffle) {
   }
 }
 
+function getRaffleCloseBufferMs(raffle) {
+  const style = raffle?.style && typeof raffle.style === 'object' ? raffle.style : null;
+  const fromStyle = style?.autoClose && typeof style.autoClose === 'object'
+    ? Number(style.autoClose.closeBufferMinutes)
+    : Number(style?.closeBufferMinutes);
+
+  const envMin = Number(process.env.RAFFLE_CLOSE_BUFFER_MINUTES);
+  const minutes = Number.isFinite(fromStyle) && fromStyle >= 0
+    ? fromStyle
+    : (Number.isFinite(envMin) && envMin >= 0 ? envMin : 2);
+
+  return Math.round(minutes * 60_000);
+}
+
+function normalizeDrawSlot(raw) {
+  const v = String(raw || '').trim().toLowerCase();
+  if (!v) return '';
+
+  // Slots principales
+  if (v === '1pm' || v === '1 pm' || v === '13' || v === '13:00' || v === '1') return '1pm';
+  if (v === '4pm' || v === '4 pm' || v === '16' || v === '16:00' || v === '4') return '4pm';
+  if (v === '10pm' || v === '10 pm' || v === '22' || v === '22:00' || v === '10' || v === 'final') return '10pm';
+
+  return v;
+}
+
+function parseInstantWinNumbers(style) {
+  const safeStyle = style && typeof style === 'object' ? style : {};
+  const raw = safeStyle.instantWins;
+  const out = [];
+
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      if (item == null) continue;
+      if (typeof item === 'number') {
+        const n = Math.trunc(item);
+        if (Number.isFinite(n) && n > 0) out.push(n);
+        continue;
+      }
+      if (typeof item === 'string') {
+        const n = Number(String(item).trim());
+        if (Number.isFinite(n) && n > 0) out.push(Math.trunc(n));
+        continue;
+      }
+      if (item && typeof item === 'object') {
+        const n = Number(item.number ?? item.ticketNumber);
+        if (Number.isFinite(n) && n > 0) out.push(Math.trunc(n));
+      }
+    }
+    return Array.from(new Set(out));
+  }
+
+  if (typeof raw === 'string') {
+    const parts = raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    for (const p of parts) {
+      const n = Number(p);
+      if (Number.isFinite(n) && n > 0) out.push(Math.trunc(n));
+    }
+    return Array.from(new Set(out));
+  }
+
+  return [];
+}
+
 async function closeRaffleInternal(raffleId, reason = 'system_time_endDate') {
   const raffle = await prisma.raffle.findUnique({ where: { id: raffleId } });
   if (!raffle) return { ok: false, code: 404, error: 'Rifa no encontrada' };
@@ -171,48 +250,19 @@ async function closeRaffleInternal(raffleId, reason = 'system_time_endDate') {
   if (status === 'closed') return { ok: false, code: 400, error: 'La rifa ya está cerrada.' };
   if (status !== 'active') return { ok: false, code: 400, error: 'Solo puedes cerrar rifas activas.' };
 
-  const tickets = await prisma.ticket.findMany({ where: { raffleId, status: 'approved' } });
   const nextStyle = raffle.style && typeof raffle.style === 'object'
     ? { ...raffle.style, autoClose: { ...(raffle.style.autoClose || {}), at: new Date().toISOString(), reason } }
     : { autoClose: { at: new Date().toISOString(), reason } };
 
-  // Si no hay tickets, cerramos igual (sin ganador)
-  if (!tickets.length) {
-    await prisma.raffle.update({
-      where: { id: raffleId },
-      data: { status: 'closed', closedAt: new Date(), style: nextStyle }
-    });
-    return { ok: true, winner: null, noSales: true };
-  }
-
-  const randomIndex = Math.floor(Math.random() * tickets.length);
-  const winningTicket = tickets[randomIndex];
-
-  await prisma.$transaction(async (tx) => {
-    await tx.winner.create({
-      data: {
-        raffleId,
-        userId: winningTicket.userId,
-        prize: raffle.prize || null,
-        status: 'pending',
-        drawDate: new Date()
-      }
-    });
-    await tx.raffle.update({
-      where: { id: raffleId },
-      data: { status: 'closed', closedAt: new Date(), style: nextStyle }
-    });
+  // En modo lotería/nacional los ganadores se publican con /admin/winners por drawSlot.
+  // Cerrar la rifa aquí significa solo: bloquear ventas y marcar status=closed.
+  const approvedCount = await prisma.ticket.count({ where: { raffleId, status: 'approved' } });
+  await prisma.raffle.update({
+    where: { id: raffleId },
+    data: { status: 'closed', closedAt: new Date(), style: nextStyle }
   });
 
-  return {
-    ok: true,
-    winner: {
-      number: winningTicket.number,
-      userId: winningTicket.userId,
-      serial: winningTicket.serialNumber
-    },
-    noSales: false
-  };
+  return { ok: true, winner: null, noSales: approvedCount === 0 };
 }
 
 async function autoCloseExpiredRaffle(raffleId, reason = 'time_endDate') {
@@ -224,7 +274,9 @@ async function autoCloseExpiredRaffle(raffleId, reason = 'time_endDate') {
 
   const endDate = getRaffleEndDate(raffle);
   if (!endDate) return { changed: false };
-  if (endDate.getTime() > Date.now()) return { changed: false };
+  const bufferMs = getRaffleCloseBufferMs(raffle);
+  const closeAtMs = endDate.getTime() - bufferMs;
+  if (Date.now() < closeAtMs) return { changed: false };
 
   const result = await closeRaffleInternal(raffleId, reason);
   return { changed: !!result.ok, result };
@@ -2195,11 +2247,15 @@ app.post('/raffles/:id/purchase', authenticateToken, async (req, res) => {
     const status = String(raffle.status || '').toLowerCase();
     if (status !== 'active') return res.status(400).json({ error: 'La rifa no está activa' });
 
-    // Validación de cierre por tiempo
+    // Validación de cierre por tiempo (con buffer: por defecto 2 min antes del endDate)
     const endDate = getRaffleEndDate(raffle);
-    if (endDate && endDate.getTime() <= Date.now()) {
+    if (endDate) {
+      const bufferMs = getRaffleCloseBufferMs(raffle);
+      const closeAtMs = endDate.getTime() - bufferMs;
+      if (Date.now() >= closeAtMs) {
       await autoCloseExpiredRaffle(raffleId, 'purchase_after_endDate');
-      return res.status(400).json({ error: 'La rifa ya cerró por tiempo' });
+        return res.status(400).json({ error: 'La rifa ya cerró por tiempo' });
+      }
     }
 
     // Anti-fraude: velocidad de compra
@@ -2243,6 +2299,15 @@ app.post('/raffles/:id/purchase', authenticateToken, async (req, res) => {
     // Wallet interna: debita comprador y acredita al vendedor (rifero)
     const sellerId = raffle.userId;
     if (!sellerId) return res.status(400).json({ error: 'Rifa sin vendedor asignado' });
+
+    const style = raffle.style && typeof raffle.style === 'object' ? raffle.style : {};
+    const instantWinNumbers = parseInstantWinNumbers(style);
+    const instantWinSet = new Set(instantWinNumbers);
+    const instantWinPrizeLabel = typeof style.instantWinPrize === 'string' && style.instantWinPrize.trim()
+      ? style.instantWinPrize.trim()
+      : 'Premio rápido';
+
+    const instantWinsAwarded = [];
 
     // Transacción
     await prisma.$transaction(async (tx) => {
@@ -2297,12 +2362,52 @@ app.post('/raffles/:id/purchase', authenticateToken, async (req, res) => {
             status: 'approved'
           }
         });
+
+        // Premios rápidos (Instant Wins): si el admin configuró números, el sistema premia automáticamente
+        // y el usuario sigue participando para 1pm/4pm/10pm (no se excluye del sorteo mayor).
+        if (instantWinSet.has(num)) {
+          const drawSlot = `instant:${num}`;
+          try {
+            // Evitar duplicados por concurrencia: si existe el registro, no crear otro.
+            const exists = await tx.winner.findFirst({ where: { raffleId, drawSlot } });
+            if (!exists) {
+              await tx.winner.create({
+                data: {
+                  raffleId,
+                  userId,
+                  drawSlot,
+                  ticketNumber: num,
+                  prize: instantWinPrizeLabel,
+                  status: 'pending',
+                  drawDate: new Date()
+                }
+              });
+              instantWinsAwarded.push({ ticketNumber: num, prize: instantWinPrizeLabel });
+            }
+          } catch (_e) {
+            // No bloquear la compra si falla el registro del premio rápido.
+          }
+        }
       }
     });
+
+    // Notificar al usuario ganador instantáneo (si tiene pushToken)
+    try {
+      if (instantWinsAwarded.length && user?.pushToken) {
+        const token = String(user.pushToken).trim();
+        if (token) {
+          // Si no hay infraestructura real de push, al menos quedará en logs.
+          console.log('[INSTANT_WIN] push to', token, 'awarded:', instantWinsAwarded);
+        }
+      }
+    } catch (_e) {
+      // no bloquear
+    }
 
     res.status(201).json({ 
       message: 'Compra exitosa', 
       numbers: newNumbers,
+      instantWinsAwarded,
       remainingBalance: user.balance - totalCost 
     });
 
@@ -2331,10 +2436,11 @@ app.post('/raffles/:id/purchase', authenticateToken, async (req, res) => {
 
 app.get('/me/raffles', authenticateToken, async (req, res) => {
   try {
+    const actorUserId = req.user.userId;
     let tickets;
     try {
       tickets = await prisma.ticket.findMany({
-        where: { userId: req.user.userId },
+        where: { userId: actorUserId },
         include: {
           raffle: {
             include: {
@@ -2358,7 +2464,7 @@ app.get('/me/raffles', authenticateToken, async (req, res) => {
       // Reintenta con un select mínimo para evitar 500 en la app.
       console.error('[GET /me/raffles] Primary query failed; falling back:', error);
       tickets = await prisma.ticket.findMany({
-        where: { userId: req.user.userId },
+        where: { userId: actorUserId },
         include: {
           raffle: {
             include: {
@@ -2378,10 +2484,40 @@ app.get('/me/raffles', authenticateToken, async (req, res) => {
     }
     
     const raffleIds = Array.from(new Set((tickets || []).map((t) => t.raffleId).filter(Boolean)));
+
+    // Resultados: si existe Winner para la rifa => resultados publicados.
+    // Ganador: si algún Winner.userId coincide con el usuario.
+    const resultByRaffleId = {};
+    if (raffleIds.length) {
+      const winners = await prisma.winner.findMany({
+        where: { raffleId: { in: raffleIds } },
+        select: { raffleId: true, userId: true, drawSlot: true }
+      });
+      for (const w of winners) {
+        const rid = w.raffleId;
+        if (!rid) continue;
+        if (!resultByRaffleId[rid]) {
+          resultByRaffleId[rid] = { resultsPublished: false, isWinner: false, hasInstantWin: false };
+        }
+        const slot = String(w.drawSlot || '').toLowerCase();
+        const isInstant = slot.startsWith('instant:') || slot === 'instant';
+        // Por defecto: consideramos resultados finales publicados cuando existe el slot 10pm.
+        // (Así se pueden anunciar premios 1pm/4pm sin que el cliente vea 'No ganaste' prematuramente.)
+        if (slot === '10pm' || slot === 'final' || slot === 'tercer' || slot === '3') {
+          resultByRaffleId[rid].resultsPublished = true;
+        }
+        if (isInstant && w.userId && Number(w.userId) === Number(actorUserId)) {
+          resultByRaffleId[rid].hasInstantWin = true;
+        }
+        if (!isInstant && w.userId && Number(w.userId) === Number(actorUserId)) {
+          resultByRaffleId[rid].isWinner = true;
+        }
+      }
+    }
     const purchases = raffleIds.length
       ? await prisma.transaction.findMany({
           where: {
-            userId: req.user.userId,
+            userId: actorUserId,
             raffleId: { in: raffleIds },
             type: 'purchase'
           },
@@ -2411,6 +2547,7 @@ app.get('/me/raffles', authenticateToken, async (req, res) => {
       if (!t) continue;
       if (!grouped[t.raffleId]) {
         const raffle = t.raffle || {};
+        const result = resultByRaffleId[t.raffleId] || { resultsPublished: false, isWinner: false };
         const seller = raffle.user || null;
         const sellerSafe = seller
           ? {
@@ -2423,7 +2560,9 @@ app.get('/me/raffles', authenticateToken, async (req, res) => {
           numbers: [],
           serialNumber: t.serialNumber,
           status: raffle.status,
-          isWinner: false,
+          isWinner: !!result.isWinner,
+          resultsPublished: !!result.resultsPublished,
+          hasInstantWin: !!result.hasInstantWin,
           createdAt: t.createdAt,
           payment: purchaseByRaffle[t.raffleId] || { totalSpent: null, purchasedAt: null, method: null }
         };
@@ -3134,7 +3273,7 @@ app.get('/admin/tickets/verify', authenticateToken, authorizeRole(['admin', 'sup
       return res.status(400).json({ valid: false, error: 'Debes enviar serial, number, cedula o name' });
     }
 
-    // Validar acceso a rifa y que sea activa
+    // Validar acceso a rifa y que sea verificable (activa o cerrada)
     const raffle = await prisma.raffle.findUnique({
       where: { id: raffleId },
       select: {
@@ -3149,8 +3288,9 @@ app.get('/admin/tickets/verify', authenticateToken, authorizeRole(['admin', 'sup
       }
     });
     if (!raffle) return res.status(404).json({ valid: false, error: 'Rifa no encontrada' });
-    if (String(raffle.status || '').toLowerCase() !== 'active') {
-      return res.status(403).json({ valid: false, error: 'Solo se puede verificar en rifas activas' });
+    const raffleStatus = String(raffle.status || '').toLowerCase();
+    if (raffleStatus !== 'active' && raffleStatus !== 'closed') {
+      return res.status(403).json({ valid: false, error: 'Solo se puede verificar en rifas activas o cerradas' });
     }
     if (actorRole !== 'superadmin' && raffle.userId !== actorId) {
       return res.status(403).json({ valid: false, error: 'No puedes verificar tickets de rifas de otros admins' });
@@ -3159,11 +3299,16 @@ app.get('/admin/tickets/verify', authenticateToken, authorizeRole(['admin', 'sup
     // Búsqueda por campos no encriptados (serial/number) directo; para nombre/cédula se filtra en memoria.
     let candidates = [];
     if (serial) {
-      const found = await prisma.ticket.findFirst({
-        where: { raffleId, serialNumber: serial },
-        include: { user: { select: { id: true, publicId: true, name: true, email: true, phone: true, cedula: true } } }
+      // Permitir búsqueda parcial por serial (muchas personas copian solo una parte)
+      const whereSerial = serial.length >= 16
+        ? { raffleId, serialNumber: { contains: serial } }
+        : { raffleId, serialNumber: { contains: serial } };
+      candidates = await prisma.ticket.findMany({
+        where: whereSerial,
+        include: { user: { select: { id: true, publicId: true, name: true, email: true, phone: true, cedula: true } } },
+        orderBy: { createdAt: 'desc' },
+        take
       });
-      candidates = found ? [found] : [];
     } else if (numberDigits) {
       const found = await prisma.ticket.findFirst({
         where: { raffleId, number: Number(numberDigits) },
@@ -3194,8 +3339,16 @@ app.get('/admin/tickets/verify', authenticateToken, authorizeRole(['admin', 'sup
           const u = t.user || {};
           const buyerName = u.name ? safeDecrypt(u.name) : '';
           const buyerCedula = u.cedula ? safeDecrypt(u.cedula) : '';
+          const buyerPhone = u.phone ? safeDecrypt(u.phone) : '';
 
-          const okCedula = cedulaDigits ? normalizeDigits(buyerCedula) === cedulaDigits : true;
+          // Algunas BD/apps guardaron "cédula" en phone. Soportar ambos.
+          const cedulaHay = normalizeDigits(buyerCedula);
+          const phoneHay = normalizeDigits(buyerPhone);
+
+          // Permitir coincidencia parcial para que funcione con fragmentos (ej: últimos 4 dígitos)
+          const okCedula = cedulaDigits
+            ? (cedulaHay.includes(cedulaDigits) || phoneHay.includes(cedulaDigits))
+            : true;
           const okName = nameQ ? normalizeName(buyerName).includes(nameQ) : true;
           if (okCedula && okName) {
             matches.push(t);
@@ -3258,13 +3411,16 @@ app.get('/admin/tickets/verify', authenticateToken, authorizeRole(['admin', 'sup
 });
 
 // Superadmin: lista de admins con rifas activas (para selección en verificador)
-app.get('/superadmin/admins/active-raffles', authenticateToken, authorizeRole(['superadmin']), async (_req, res) => {
+app.get('/superadmin/admins/active-raffles', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
   try {
+    const includeClosed = String(req.query.includeClosed || '').trim() === '1' || String(req.query.includeClosed || '').trim().toLowerCase() === 'true';
+    const statuses = includeClosed ? ['active', 'closed'] : ['active'];
     const raffles = await prisma.raffle.findMany({
-      where: { status: 'active' },
+      where: { status: { in: statuses } },
       select: {
         id: true,
         title: true,
+        status: true,
         createdAt: true,
         activatedAt: true,
         userId: true,
@@ -3291,6 +3447,7 @@ app.get('/superadmin/admins/active-raffles', authenticateToken, authorizeRole(['
       byAdmin.get(key).activeRaffles.push({
         id: r.id,
         title: r.title,
+        status: r.status,
         createdAt: r.createdAt,
         activatedAt: r.activatedAt
       });
@@ -3903,39 +4060,121 @@ app.post('/admin/security-code/regenerate', authenticateToken, authorizeRole(['a
 // --- ADMIN WINNERS MANAGEMENT ---
 
 app.post('/admin/winners', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
-  const { raffleId, ticketNumber, winnerName, prize, testimonial, photoUrl } = req.body;
-  
-  if (!raffleId || !winnerName || !prize) {
-    return res.status(400).json({ error: 'Faltan datos requeridos (Rifa, Nombre, Premio)' });
+  const { raffleId, ticketNumber, drawSlot, prize, testimonial, photoUrl } = req.body;
+
+  const rid = Number(raffleId);
+  const tnum = Number(ticketNumber);
+  const slotRaw = String(drawSlot || '').trim();
+  if (!rid || !Number.isFinite(rid)) {
+    return res.status(400).json({ error: 'raffleId requerido' });
+  }
+  if (!tnum || !Number.isFinite(tnum)) {
+    return res.status(400).json({ error: 'ticketNumber requerido' });
+  }
+  const slot = normalizeDrawSlot(slotRaw);
+  if (!slot) return res.status(400).json({ error: 'drawSlot requerido (ej: 1pm, 4pm, 10pm)' });
+  if (!['1pm', '4pm', '10pm'].includes(slot)) {
+    return res.status(400).json({ error: 'drawSlot inválido. Usa 1pm, 4pm o 10pm.' });
+  }
+  if (!String(prize || '').trim()) {
+    return res.status(400).json({ error: 'Premio requerido' });
   }
 
   try {
-    // Intentar buscar usuario por ticket si existe
-    let userId = null;
-    if (ticketNumber) {
-      const ticket = await prisma.ticket.findFirst({
-        where: { raffleId: Number(raffleId), number: Number(ticketNumber) },
-        include: { user: true }
-      });
-      if (ticket) userId = ticket.userId;
+    const actorRole = String(req.user?.role || '').toLowerCase();
+    const actorId = req.user?.userId;
+
+    const raffle = await prisma.raffle.findUnique({
+      where: { id: rid },
+      select: { id: true, status: true, userId: true, title: true }
+    });
+    if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
+
+    // Admin solo puede declarar ganador de sus rifas.
+    if (actorRole !== 'superadmin' && raffle.userId !== actorId) {
+      return res.status(403).json({ error: 'No autorizado para declarar ganador en esta rifa' });
+    }
+
+    // Permitir publicación de ganadores mientras la rifa está activa o cerrada.
+    // Esto soporta múltiples premios (1pm/4pm/10pm) sin bloquear el proceso.
+    const st = String(raffle.status || '').toLowerCase();
+    if (st !== 'active' && st !== 'closed') {
+      return res.status(400).json({ error: 'Estado de rifa inválido para publicar ganadores' });
+    }
+
+    // Evitar duplicados por slot (1 ganador por 1pm / 4pm / 10pm).
+    const existingSlot = await prisma.winner.findFirst({ where: { raffleId: rid, drawSlot: slot } });
+    if (existingSlot) return res.status(409).json({ error: `Ya existe ganador publicado para ${slot}` });
+
+    // Punto clave anti-confusión: el ticket DEBE existir en ESA rifa (raffleId + number)
+    const ticket = await prisma.ticket.findFirst({
+      where: { raffleId: rid, number: tnum },
+      include: { user: { select: { id: true, name: true, email: true, avatar: true } } }
+    });
+    if (!ticket) {
+      return res.status(404).json({ error: 'Ese número no existe como ticket comprado en esta rifa' });
     }
 
     const winner = await prisma.winner.create({
       data: {
-        raffleId: Number(raffleId),
-        userId,
-        prize,
-        testimonial: testimonial || '',
-        photoUrl: photoUrl || null,
-        // Si no hay usuario registrado, guardamos el nombre en el testimonio o necesitamos campo extra.
-        // Por ahora el schema tiene userId opcional.
+        raffleId: rid,
+        userId: ticket.userId,
+        drawSlot: slot,
+        ticketNumber: tnum,
+        prize: String(prize).trim(),
+        testimonial: String(testimonial || '').trim(),
+        photoUrl: photoUrl || null
       }
     });
 
-    res.json({ message: 'Ganador publicado exitosamente', winner });
+    const winnerName = ticket.user?.name ? safeDecrypt(ticket.user.name) : null;
+
+    // Notificar participantes (sin bloquear por KYC para no retrasar publicación)
+    try {
+      const participants = await prisma.ticket.findMany({
+        where: { raffleId: rid },
+        distinct: ['userId'],
+        select: { user: { select: { pushToken: true } } }
+      });
+      const tokens = (participants || []).map((p) => p?.user?.pushToken).filter(Boolean);
+      if (tokens.length > 0) {
+        const title = `¡Resultados (${slot}): ${raffle.title}!`;
+        const body = `Número ganador: ${tnum}.`;
+        sendPushNotification(tokens, title, body, { type: 'raffle_result', raffleId: rid, drawSlot: slot, ticketNumber: tnum }).catch(console.error);
+      }
+    } catch (_e) {
+      // no bloquear
+    }
+
+    try {
+      await prisma.auditLog.create({
+        data: {
+          action: 'RESULT_PUBLISHED',
+          entity: 'Raffle',
+          userEmail: req.user.email,
+          detail: `Results published for raffle ${rid} (${slot}). Winner ticket: ${tnum}.`,
+          timestamp: new Date()
+        }
+      });
+    } catch (_e) {
+      // no bloquear
+    }
+
+    return res.json({
+      message: 'Ganador publicado exitosamente',
+      winner,
+      raffle: { id: raffle.id, title: raffle.title },
+      ticket: { number: ticket.number },
+      user: {
+        id: ticket.user?.id,
+        name: winnerName,
+        email: ticket.user?.email,
+        avatar: ticket.user?.avatar
+      }
+    });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: 'Error al publicar ganador' });
+    return res.status(500).json({ error: 'Error al publicar ganador' });
   }
 });
 
@@ -3949,7 +4188,22 @@ app.get('/winners', async (req, res) => {
       orderBy: { drawDate: 'desc' },
       take: 20
     });
-    res.json(winners);
+    const mapped = (Array.isArray(winners) ? winners : []).map((w) => {
+      const u = w.user || null;
+      const r = w.raffle || null;
+      const safeUser = u
+        ? {
+            ...u,
+            name: u.name ? safeDecrypt(u.name) : u.name
+          }
+        : null;
+      return {
+        ...w,
+        raffle: r ? { ...r, raffleId: w.raffleId } : { raffleId: w.raffleId },
+        user: safeUser
+      };
+    });
+    res.json(mapped);
   } catch (error) {
     res.status(500).json({ error: 'Error al obtener ganadores' });
   }
@@ -4004,19 +4258,29 @@ app.get('/admin/system/fix-db', async (req, res) => {
     await prisma.$executeRawUnsafe(`ALTER TABLE "SystemSettings" ADD COLUMN IF NOT EXISTS "techSupport" JSONB;`);
     await prisma.$executeRawUnsafe(`ALTER TABLE "SystemSettings" ADD COLUMN IF NOT EXISTS "securityCode" TEXT;`);
 
-    // Crear tabla Winner si no existe
+    // Crear tabla Winner si no existe (incluye slots/numero para 3 premios)
     await prisma.$executeRawUnsafe(`
       CREATE TABLE IF NOT EXISTS "Winner" (
         "id" SERIAL NOT NULL,
         "raffleId" INTEGER NOT NULL,
         "userId" INTEGER,
+        "drawSlot" TEXT,
+        "ticketNumber" INTEGER,
         "photoUrl" TEXT,
         "testimonial" TEXT,
         "prize" TEXT,
+        "status" TEXT NOT NULL DEFAULT 'pending',
         "drawDate" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
         CONSTRAINT "Winner_pkey" PRIMARY KEY ("id")
       );
     `);
+
+    // Asegurar columnas (por si la tabla ya existía vieja)
+    await prisma.$executeRawUnsafe(`ALTER TABLE "Winner" ADD COLUMN IF NOT EXISTS "drawSlot" TEXT;`);
+    await prisma.$executeRawUnsafe(`ALTER TABLE "Winner" ADD COLUMN IF NOT EXISTS "ticketNumber" INTEGER;`);
+    await prisma.$executeRawUnsafe(`ALTER TABLE "Winner" ADD COLUMN IF NOT EXISTS "status" TEXT NOT NULL DEFAULT 'pending';`);
+    try { await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "Winner_raffleId_drawSlot_idx" ON "Winner"("raffleId", "drawSlot");`); } catch (e) {}
+    try { await prisma.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS "Winner_raffleId_ticketNumber_idx" ON "Winner"("raffleId", "ticketNumber");`); } catch (e) {}
 
     // Crear tabla Announcement si no existe
     await prisma.$executeRawUnsafe(`
@@ -4103,7 +4367,7 @@ app.post('/raffles/:id/close', authenticateToken, authorizeRole(['admin', 'super
     }
 
     return res.json({
-      message: result.noSales ? 'Rifa cerrada (sin ventas)' : 'Sorteo realizado',
+      message: result.noSales ? 'Rifa cerrada (sin ventas)' : 'Rifa cerrada',
       winner: result.winner,
       raffleDeleted: false
     });
@@ -5397,99 +5661,6 @@ cron.schedule(
     timezone: process.env.AUDIT_REPORT_TIMEZONE || 'America/Caracas'
   }
 );
-
-// --- WINNERS ---
-app.get('/winners', async (req, res) => {
-  try {
-    const winners = await prisma.winner.findMany({
-      orderBy: { drawDate: 'desc' },
-      include: {
-        user: { select: { name: true, avatar: true, publicId: true } },
-        raffle: { select: { title: true } }
-      }
-    });
-    res.json(winners);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Error al obtener ganadores' });
-  }
-});
-
-app.post('/admin/winners', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
-  try {
-    const { raffleId, userId, photoUrl, testimonial, prize } = req.body;
-    
-    // Enforce KYC for winners
-    if (userId) {
-      const user = await prisma.user.findUnique({ where: { id: Number(userId) } });
-      if (!user) return res.status(404).json({ error: 'Usuario ganador no encontrado' });
-      
-      if (!user.identityVerified) {
-        return res.status(400).json({ 
-          error: 'El usuario ganador NO ha verificado su identidad (KYC). No se puede registrar como ganador hasta cumplir con la normativa Anti-Lavado de Dinero.' 
-        });
-      }
-    }
-
-    const winner = await prisma.winner.create({
-      data: {
-        raffleId: Number(raffleId),
-        userId: userId ? Number(userId) : null,
-        photoUrl,
-        testimonial,
-        prize,
-        status: 'delivered'
-      }
-    });
-
-    // --- NOTIFICATION SYSTEM ---
-    // 1. Get Raffle Details
-    const raffle = await prisma.raffle.findUnique({ where: { id: Number(raffleId) } });
-
-    // 2. Get Participants (Unique Users who bought tickets)
-    const participants = await prisma.ticket.findMany({
-      where: { raffleId: Number(raffleId) },
-      distinct: ['userId'],
-      select: { 
-        user: { select: { pushToken: true, email: true, name: true } } 
-      }
-    });
-
-    // 3. Prepare Notification Content
-    let winnerName = 'Por anunciar';
-    if (userId) {
-      const winnerUser = await prisma.user.findUnique({ where: { id: Number(userId) } });
-      if (winnerUser && winnerUser.name) winnerName = decrypt(winnerUser.name);
-    }
-
-    const title = `¡Resultados: ${raffle.title}!`;
-    const body = `El ganador es: ${winnerName}. ¡Entra para ver los detalles!`;
-
-    // 4. Send Push Notifications
-    const tokens = participants.map(p => p.user.pushToken).filter(Boolean);
-    if (tokens.length > 0) {
-      // Send in background
-      sendPushNotification(tokens, title, body, { type: 'raffle_result', raffleId: Number(raffleId) }).catch(console.error);
-    }
-
-    // 5. Audit Log (Proof of Publication Time)
-    await prisma.auditLog.create({
-      data: {
-        action: 'RESULT_PUBLISHED',
-        entity: 'Raffle',
-        userEmail: req.user.email,
-        detail: `Results published for raffle ${raffleId}. Winner: ${winnerName}. Notified ${tokens.length} participants at ${new Date().toISOString()}.`,
-        timestamp: new Date()
-      }
-    });
-    // ---------------------------
-
-    res.json(winner);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Error al registrar ganador' });
-  }
-});
 
 // --- SECURITY ---
 app.post('/me/change-password', authenticateToken, async (req, res) => {

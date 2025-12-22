@@ -60,6 +60,9 @@ model Winner {
   id          Int      @id @default(autoincrement())
   raffleId    Int
   userId      Int?
+  // Para soportar múltiples premios por rifa (1pm/4pm/10pm) sin confundir números
+  drawSlot    String?  // ej: "1pm" | "4pm" | "10pm"
+  ticketNumber Int?    // número ganador dentro de la rifa
   photoUrl    String?
   testimonial String?
   prize       String?
@@ -67,6 +70,9 @@ model Winner {
   drawDate    DateTime @default(now())
   raffle      Raffle   @relation(fields: [raffleId], references: [id])
   user        User?    @relation(fields: [userId], references: [id])
+
+  @@index([raffleId, drawSlot])
+  @@index([raffleId, ticketNumber])
 }
 
 model KYCRequest {
