@@ -3452,31 +3452,100 @@ app.post('/admin/raffles/:id/activate', authenticateToken, authorizeRole(['admin
 });
 
 app.patch('/admin/raffles/:id', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
-  const { id } = req.params;
-  const data = req.body;
+  const raffleId = Number(req.params.id);
+  if (!Number.isFinite(raffleId) || raffleId <= 0) {
+    return res.status(400).json({ error: 'ID inválido' });
+  }
+
+  const body = (req.body && typeof req.body === 'object') ? req.body : {};
+
   try {
     const actorRole = String(req.user?.role || '').toLowerCase();
     const actorId = req.user?.userId;
-    const raffle = await prisma.raffle.findUnique({ where: { id: Number(id) }, select: { userId: true } });
+
+    const raffle = await prisma.raffle.findUnique({ where: { id: raffleId }, select: { userId: true, style: true } });
     if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
     if (actorRole !== 'superadmin' && raffle.userId !== actorId) {
       return res.status(403).json({ error: 'No puedes editar rifas de otros usuarios.' });
     }
 
-    // Handle style update specifically if nested
-    if (data.style) {
-      const current = await prisma.raffle.findUnique({ where: { id: Number(id) }, select: { style: true } });
-      data.style = { ...(current?.style || {}), ...data.style };
+    const nextData = {};
+
+    if (body.title !== undefined) nextData.title = String(body.title || '').trim();
+
+    // Compat: aceptar description/prize para el campo prisma `prize`
+    if (body.description !== undefined || body.prize !== undefined) {
+      const prizeValue = body.description !== undefined ? body.description : body.prize;
+      nextData.prize = String(prizeValue || '').trim();
     }
-    
+
+    if (body.terms !== undefined) {
+      const termsValue = body.terms;
+      nextData.terms = (termsValue === null || String(termsValue).trim() === '') ? null : String(termsValue);
+    }
+
+    if (body.lottery !== undefined) {
+      const lotteryValue = body.lottery;
+      nextData.lottery = (lotteryValue === null || String(lotteryValue).trim() === '') ? null : String(lotteryValue);
+    }
+
+    // Compat: aceptar price/ticketPrice, coercionar a number
+    if (body.ticketPrice !== undefined || body.price !== undefined) {
+      const rawPrice = body.ticketPrice !== undefined ? body.ticketPrice : body.price;
+      const priceNumber = Number(rawPrice);
+      if (!Number.isFinite(priceNumber) || priceNumber < 0) {
+        return res.status(400).json({ error: 'Precio inválido' });
+      }
+      nextData.ticketPrice = priceNumber;
+    }
+
+    if (body.totalTickets !== undefined) {
+      const ticketsNumber = Number(body.totalTickets);
+      if (!Number.isFinite(ticketsNumber) || ticketsNumber <= 0) {
+        return res.status(400).json({ error: 'Total de tickets inválido' });
+      }
+      const maxTickets = 10000;
+      if (ticketsNumber > maxTickets) {
+        return res.status(400).json({ error: `El máximo de tickets permitidos es ${maxTickets}` });
+      }
+      nextData.totalTickets = Math.trunc(ticketsNumber);
+    }
+
+    // Permitir `status` solo en valores conocidos
+    if (body.status !== undefined) {
+      const st = String(body.status || '').trim().toLowerCase();
+      if (!['draft', 'active', 'closed'].includes(st)) {
+        return res.status(400).json({ error: 'Estado inválido' });
+      }
+      nextData.status = st;
+    }
+
+    // Manejo de style: merge + compat con llaves top-level usadas por el front.
+    const stylePatch = (body.style && typeof body.style === 'object' && !Array.isArray(body.style)) ? body.style : null;
+    const styleExtras = {};
+    const styleKeys = ['digits', 'startDate', 'endDate', 'securityCode', 'instantWins', 'minTickets', 'paymentMethods'];
+    for (const key of styleKeys) {
+      if (body[key] !== undefined) styleExtras[key] = body[key];
+    }
+
+    if (stylePatch || Object.keys(styleExtras).length > 0) {
+      const currentStyle = (raffle.style && typeof raffle.style === 'object') ? raffle.style : {};
+      nextData.style = { ...currentStyle, ...(stylePatch || {}), ...styleExtras };
+    }
+
+    if (Object.keys(nextData).length === 0) {
+      return res.status(400).json({ error: 'No hay cambios para aplicar' });
+    }
+
     const updatedRaffle = await prisma.raffle.update({
-      where: { id: Number(id) },
-      data
+      where: { id: raffleId },
+      data: nextData
     });
-    res.json(updatedRaffle);
+
+    return res.json(updatedRaffle);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: 'Error al actualizar rifa' });
+    return res.status(500).json({ error: 'Error al actualizar rifa' });
   }
 });
 
@@ -4524,6 +4593,276 @@ app.patch('/superadmin/reports/:id', authenticateToken, authorizeRole(['superadm
       return res.status(503).json({ error: 'Función no disponible: falta aplicar migración de reportes (Report).' });
     }
     return res.status(500).json({ error: 'Error al actualizar reporte' });
+  }
+});
+
+// --- SUPERADMIN: ADMINISTRACIÓN GLOBAL DE RIFAS ---
+
+app.get('/superadmin/riferos/search', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
+  try {
+    const qRaw = String(req.query?.q || '').trim();
+    const take = Math.min(Math.max(Number(req.query?.take) || 20, 1), 50);
+    const includeInactive = String(req.query?.includeInactive || '').trim().toLowerCase() === 'true';
+
+    if (!qRaw) return res.json([]);
+
+    const qLower = qRaw.toLowerCase();
+    const looksLikeEmail = qLower.includes('@');
+
+    const baseWhere = {
+      role: 'admin',
+      ...(includeInactive ? {} : { active: true })
+    };
+
+    const or = [];
+    if (looksLikeEmail) {
+      or.push({ email: { contains: qRaw, mode: 'insensitive' } });
+    } else {
+      or.push({ publicId: { contains: qRaw, mode: 'insensitive' } });
+      or.push({ securityId: { contains: qRaw, mode: 'insensitive' } });
+      // fallback: búsqueda por email parcial aunque no tenga @
+      or.push({ email: { contains: qRaw, mode: 'insensitive' } });
+    }
+
+    const selectUser = {
+      id: true,
+      publicId: true,
+      email: true,
+      name: true,
+      active: true,
+      securityId: true,
+      createdAt: true,
+      _count: { select: { raffles: true } },
+      raffles: {
+        where: { status: 'active' },
+        orderBy: [{ activatedAt: 'desc' }, { createdAt: 'desc' }],
+        take: 6,
+        select: { id: true, title: true, status: true, activatedAt: true, createdAt: true }
+      }
+    };
+
+    const primary = await prisma.user.findMany({
+      where: { ...baseWhere, OR: or },
+      take,
+      orderBy: { createdAt: 'desc' },
+      select: selectUser
+    });
+
+    const byId = new Map(primary.map((u) => [u.id, u]));
+
+    // Búsqueda por nombre (encriptado): escaneo limitado SOLO si hace falta.
+    if (!looksLikeEmail && byId.size < take && qLower.length >= 2) {
+      const scanTake = Math.min(Math.max(Number(req.query?.scanTake) || 250, 50), 1200);
+      const candidates = await prisma.user.findMany({
+        where: baseWhere,
+        take: scanTake,
+        orderBy: { createdAt: 'desc' },
+        select: selectUser
+      });
+
+      for (const u of candidates) {
+        if (byId.size >= take) break;
+        const name = u?.name ? String(safeDecrypt(u.name) || '').toLowerCase() : '';
+        if (name && name.includes(qLower)) {
+          byId.set(u.id, u);
+        }
+      }
+    }
+
+    const list = Array.from(byId.values())
+      .sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime())
+      .slice(0, take)
+      .map((u) => ({
+        id: u.id,
+        publicId: u.publicId,
+        email: u.email,
+        name: u.name ? safeDecrypt(u.name) : u.name,
+        active: u.active,
+        securityId: u.securityId,
+        totalRaffles: u._count?.raffles || 0,
+        activeRaffles: Array.isArray(u.raffles) ? u.raffles : [],
+        activeRafflesCount: Array.isArray(u.raffles) ? u.raffles.length : 0
+      }));
+
+    return res.json(list);
+  } catch (error) {
+    console.error('[SUPERADMIN][riferos/search] error:', error);
+    return res.status(500).json({ error: 'Error al buscar riferos' });
+  }
+});
+
+app.get('/superadmin/riferos/:id/raffles', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
+  try {
+    const idRaw = String(req.params.id || '').trim();
+    if (!idRaw) return res.status(400).json({ error: 'ID inválido' });
+
+    const isNumeric = /^\d+$/.test(idRaw);
+    const user = await prisma.user.findUnique({
+      where: isNumeric ? { id: Number(idRaw) } : { publicId: idRaw },
+      select: { id: true, publicId: true, email: true, name: true, active: true, securityId: true }
+    });
+    if (!user) return res.status(404).json({ error: 'Rifero no encontrado' });
+
+    const status = String(req.query?.status || 'active').trim().toLowerCase();
+    const allowed = new Set(['active', 'draft', 'closed', 'all']);
+    if (!allowed.has(status)) return res.status(400).json({ error: 'Estado inválido' });
+
+    const where = {
+      userId: user.id,
+      ...(status === 'all' ? {} : { status })
+    };
+
+    const raffles = await prisma.raffle.findMany({
+      where,
+      orderBy: [{ createdAt: 'desc' }],
+      include: { _count: { select: { tickets: true } } }
+    });
+
+    return res.json({
+      user: {
+        id: user.id,
+        publicId: user.publicId,
+        email: user.email,
+        name: user.name ? safeDecrypt(user.name) : user.name,
+        active: user.active,
+        securityId: user.securityId
+      },
+      raffles: raffles.map((r) => ({ ...r, soldTickets: r._count?.tickets || 0 }))
+    });
+  } catch (error) {
+    console.error('[SUPERADMIN][riferos/:id/raffles] error:', error);
+    return res.status(500).json({ error: 'Error al obtener rifas del rifero' });
+  }
+});
+
+app.post('/superadmin/raffles/:id/report', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
+  try {
+    const raffleId = Number(req.params.id);
+    if (!Number.isFinite(raffleId) || raffleId <= 0) return res.status(400).json({ error: 'ID inválido' });
+
+    const reason = String(req.body?.reason || '').trim();
+    const details = req.body?.details == null ? null : String(req.body.details);
+    if (!reason) return res.status(400).json({ error: 'Motivo requerido' });
+
+    const raffle = await prisma.raffle.findUnique({ where: { id: raffleId }, select: { id: true, title: true, status: true, userId: true } });
+    if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
+    if (!raffle.userId) return res.status(400).json({ error: 'La rifa no tiene rifero asignado' });
+
+    const actorId = Number(req.user?.userId) || null;
+    const actorEmail = String(req.user?.email || '');
+
+    let report = null;
+    try {
+      report = await prisma.report.create({
+        data: {
+          reason,
+          details,
+          status: 'open',
+          reporterUserId: actorId,
+          reportedUserId: raffle.userId,
+          raffleId: raffle.id,
+          reviewedById: actorId,
+          reviewedAt: new Date()
+        }
+      });
+    } catch (e) {
+      if (isPrismaMissingTableError(e)) {
+        return res.status(503).json({ error: 'Función no disponible: falta aplicar migración de reportes (Report).' });
+      }
+      throw e;
+    }
+
+    try {
+      await prisma.auditLog.create({
+        data: {
+          action: 'RAFFLE_REPORTED',
+          userId: actorId,
+          userEmail: actorEmail,
+          entity: 'Raffle',
+          entityId: String(raffle.id),
+          detail: `Reporte creado para rifa #${raffle.id} (${raffle.title}). Motivo=${reason}`,
+          ipAddress: String(req.ip || ''),
+          userAgent: String(req.headers['user-agent'] || ''),
+          severity: 'WARN',
+          metadata: { reason }
+        }
+      });
+    } catch (_e) {
+      // no bloquear
+    }
+
+    return res.status(201).json({ message: 'Reporte creado', reportId: report?.id || null });
+  } catch (error) {
+    console.error('[SUPERADMIN][raffles/:id/report] error:', error);
+    return res.status(500).json({ error: 'Error al reportar rifa' });
+  }
+});
+
+app.post('/superadmin/raffles/:id/close', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
+  try {
+    const raffleId = Number(req.params.id);
+    if (!Number.isFinite(raffleId) || raffleId <= 0) return res.status(400).json({ error: 'ID inválido' });
+
+    const reason = String(req.body?.reason || '').trim();
+    const details = req.body?.details == null ? null : String(req.body.details);
+    if (!reason) return res.status(400).json({ error: 'Motivo requerido' });
+
+    const actorId = Number(req.user?.userId) || null;
+    const actorEmail = String(req.user?.email || '');
+
+    const raffle = await prisma.raffle.findUnique({ where: { id: raffleId }, select: { id: true, title: true, status: true, userId: true } });
+    if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
+
+    const updated = await prisma.raffle.update({
+      where: { id: raffleId },
+      data: { status: 'closed', closedAt: new Date() }
+    });
+
+    // Intentar crear reporte asociado (si existe la tabla)
+    if (raffle.userId) {
+      try {
+        await prisma.report.create({
+          data: {
+            reason: `CIERRE_SUPERADMIN: ${reason}`,
+            details,
+            status: 'reviewed',
+            reporterUserId: actorId,
+            reportedUserId: raffle.userId,
+            raffleId: raffle.id,
+            reviewedById: actorId,
+            reviewedAt: new Date()
+          }
+        });
+      } catch (e) {
+        if (!isPrismaMissingTableError(e)) {
+          console.error('[SUPERADMIN][close] report create failed:', e);
+        }
+      }
+    }
+
+    try {
+      await prisma.auditLog.create({
+        data: {
+          action: 'RAFFLE_CLOSED_BY_SUPERADMIN',
+          userId: actorId,
+          userEmail: actorEmail,
+          entity: 'Raffle',
+          entityId: String(updated.id),
+          detail: `Rifa cerrada por superadmin #${updated.id} (${updated.title}). Motivo=${reason}`,
+          ipAddress: String(req.ip || ''),
+          userAgent: String(req.headers['user-agent'] || ''),
+          severity: 'WARN',
+          metadata: { reason }
+        }
+      });
+    } catch (_e) {
+      // no bloquear
+    }
+
+    return res.json({ message: 'Rifa cerrada', raffle: updated });
+  } catch (error) {
+    console.error('[SUPERADMIN][raffles/:id/close] error:', error);
+    return res.status(500).json({ error: 'Error al cerrar rifa' });
   }
 });
 
