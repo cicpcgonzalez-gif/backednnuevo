@@ -11,6 +11,7 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "migrate": "prisma migrate deploy || prisma db push",
     "seed:superadmin": "node create_superadmin.js",
+    "reset:superadmin": "node scripts/reset_to_superadmin.js --yes",
     "postinstall": "prisma generate",
     "android": "expo run:android",
     "ios": "expo run:ios"

@@ -656,8 +656,9 @@ async function sendEmail(to, subject, text, html, options = {}) {
         // Fallback a SMTP si falla la API? No, si falla la API es probable que SMTP también falle.
         // Pero dejaremos que continúe al bloque SMTP por si acaso, o retornamos false.
         // Mejor retornamos false para no duplicar intentos si la API falló explícitamente.
+        const errMsg = String(apiError?.message || apiError || '').slice(0, 500);
         await prisma.mailLog.create({
-          data: { to, subject, status: 'FAILED_API', timestamp: new Date() }
+          data: { to, subject, status: 'FAILED_API', error: errMsg || null, timestamp: new Date() }
         });
         return false;
       }
@@ -705,8 +706,9 @@ async function sendEmail(to, subject, text, html, options = {}) {
   } catch (error) {
     console.error('Error sending email:', error);
     try {
+      const errMsg = String(error?.message || error || '').slice(0, 500);
       await prisma.mailLog.create({
-        data: { to, subject, status: 'FAILED', timestamp: new Date() }
+        data: { to, subject, status: 'FAILED', error: errMsg || null, timestamp: new Date() }
       });
     } catch (logError) {
       console.warn('Failed to log email failure to DB:', logError.message);
@@ -714,6 +716,42 @@ async function sendEmail(to, subject, text, html, options = {}) {
     return false;
   }
 }
+
+// Superadmin: enviar correo de prueba y devolver el último MailLog asociado
+app.post('/superadmin/test-email', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
+  try {
+    const to = String(req.body?.to || '').trim();
+    const forceSmtp = req.body?.forceSmtp === true;
+    if (!to || !to.includes('@')) {
+      return res.status(400).json({ error: 'Email inválido' });
+    }
+
+    const stamp = new Date();
+    const subject = `MegaRifas TEST ${stamp.toISOString()}`;
+    const ok = await sendEmail(
+      to,
+      subject,
+      'Correo de prueba MegaRifas. Si ves esto, el envío funciona.',
+      `<h2>MegaRifas</h2><p>Correo de prueba MegaRifas.</p><p><b>Hora:</b> ${escapeHtml(stamp.toISOString())}</p>`,
+      { forceSmtp }
+    );
+
+    let last = null;
+    try {
+      last = await prisma.mailLog.findFirst({
+        where: { to, subject },
+        orderBy: { timestamp: 'desc' }
+      });
+    } catch (_e) {
+      last = null;
+    }
+
+    return res.json({ ok, mailLog: last });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'No se pudo enviar correo de prueba' });
+  }
+});
 
 function parseEmailList(value) {
   return String(value || '')

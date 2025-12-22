@@ -130,7 +130,13 @@ async function resetToSuperadmin() {
     console.log('Borrando datos (excepto superadmin)...');
 
     // Orden importante por llaves foráneas
+    // Reacciones y módulos que dependen de usuarios/entidades
     await safeDeleteMany(prisma, 'reaction');
+    await safeDeleteMany(prisma, 'raffleReaction');
+    await safeDeleteMany(prisma, 'raffleRating');
+    await safeDeleteMany(prisma, 'report');
+    await safeDeleteMany(prisma, 'userBoost');
+
     await safeDeleteMany(prisma, 'announcement');
 
     await safeDeleteMany(prisma, 'ticket');
