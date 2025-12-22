@@ -3915,6 +3915,9 @@ app.get('/admin/tickets', authenticateToken, authorizeRole(['admin', 'superadmin
 // --- ADMIN METRICS ---
 app.get('/admin/metrics/summary', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
   try {
+    const actorRole = String(req.user?.role || '').toLowerCase();
+    const actorId = req.user?.userId;
+
     const raffleIdRaw = req.query?.raffleId;
     const raffleIdNum = raffleIdRaw !== undefined && raffleIdRaw !== null && raffleIdRaw !== '' ? Number(raffleIdRaw) : null;
     if (raffleIdNum !== null && (!Number.isFinite(raffleIdNum) || raffleIdNum <= 0)) {
@@ -3924,33 +3927,88 @@ app.get('/admin/metrics/summary', authenticateToken, authorizeRole(['admin', 'su
     const startOfDay = new Date();
     startOfDay.setHours(0, 0, 0, 0);
 
-    const ticketWhere = {};
-    if (raffleIdNum) ticketWhere.raffleId = raffleIdNum;
-
-    const tickets = await prisma.ticket.findMany({
-      where: ticketWhere,
-      select: {
-        createdAt: true,
-        userId: true,
-        raffle: { select: { ticketPrice: true } }
+    // Para evitar timeouts en BD grandes: usar agregaciones en vez de traer todos los tickets.
+    // Si se pasa raffleId, validar ownership (admin) y usar su ticketPrice para revenue.
+    if (raffleIdNum) {
+      const raffle = await prisma.raffle.findUnique({ where: { id: raffleIdNum }, select: { id: true, userId: true, ticketPrice: true } });
+      if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
+      if (actorRole !== 'superadmin' && raffle.userId !== actorId) {
+        return res.status(403).json({ error: 'No puedes ver métricas de rifas de otros admins' });
       }
-    });
-    const todayTickets = tickets.filter((t) => t.createdAt >= startOfDay);
-    const ticketsSold = tickets.length;
-    const participants = new Set(tickets.map((t) => t.userId)).size;
-    const totalRevenue = tickets.reduce((acc, t) => acc + (t.raffle?.ticketPrice || 0), 0);
-    const todayRevenue = todayTickets.reduce((acc, t) => acc + (t.raffle?.ticketPrice || 0), 0);
 
-    const pendingWhere = { status: 'pending' };
-    if (raffleIdNum) pendingWhere.raffleId = raffleIdNum;
-    const pendingPayments = await prisma.transaction.count({ where: pendingWhere });
+      const price = Number(raffle.ticketPrice || 0);
+      const ticketsSold = await prisma.ticket.count({ where: { raffleId: raffleIdNum } });
+      const todaySales = await prisma.ticket.count({ where: { raffleId: raffleIdNum, createdAt: { gte: startOfDay } } });
+      const participants = (await prisma.ticket.groupBy({ by: ['userId'], where: { raffleId: raffleIdNum }, _count: { userId: true } })).length;
+      const pendingPayments = await prisma.transaction.count({ where: { raffleId: raffleIdNum, type: 'manual_payment', status: 'pending' } });
+
+      return res.json({
+        ticketsSold,
+        participants,
+        pendingPayments,
+        totalRevenue: ticketsSold * price,
+        todaySales,
+        todayRevenue: todaySales * price
+      });
+    }
+
+    // Sin raffleId: métricas agregadas sobre rifas accesibles.
+    const raffles = await prisma.raffle.findMany({
+      where: actorRole === 'superadmin' ? {} : { userId: actorId },
+      select: { id: true, ticketPrice: true }
+    });
+    const raffleIds = raffles.map((r) => r.id).filter(Boolean);
+    if (!raffleIds.length) {
+      return res.json({ ticketsSold: 0, participants: 0, pendingPayments: 0, totalRevenue: 0, todaySales: 0, todayRevenue: 0 });
+    }
+
+    const priceByRaffleId = new Map(raffles.map((r) => [r.id, Number(r.ticketPrice || 0)]));
+
+    const groupedAll = await prisma.ticket.groupBy({
+      by: ['raffleId'],
+      where: { raffleId: { in: raffleIds } },
+      _count: { raffleId: true }
+    });
+
+    const groupedToday = await prisma.ticket.groupBy({
+      by: ['raffleId'],
+      where: { raffleId: { in: raffleIds }, createdAt: { gte: startOfDay } },
+      _count: { raffleId: true }
+    });
+
+    const ticketsSold = groupedAll.reduce((acc, row) => acc + (row?._count?.raffleId || 0), 0);
+    const todaySales = groupedToday.reduce((acc, row) => acc + (row?._count?.raffleId || 0), 0);
+
+    const totalRevenue = groupedAll.reduce((acc, row) => {
+      const rid = row.raffleId;
+      const count = row?._count?.raffleId || 0;
+      const price = priceByRaffleId.get(rid) || 0;
+      return acc + count * price;
+    }, 0);
+
+    const todayRevenue = groupedToday.reduce((acc, row) => {
+      const rid = row.raffleId;
+      const count = row?._count?.raffleId || 0;
+      const price = priceByRaffleId.get(rid) || 0;
+      return acc + count * price;
+    }, 0);
+
+    const participants = (await prisma.ticket.groupBy({
+      by: ['userId'],
+      where: { raffleId: { in: raffleIds } },
+      _count: { userId: true }
+    })).length;
+
+    const pendingPayments = await prisma.transaction.count({
+      where: { raffleId: { in: raffleIds }, type: 'manual_payment', status: 'pending' }
+    });
 
     res.json({
       ticketsSold,
       participants,
       pendingPayments,
       totalRevenue,
-      todaySales: todayTickets.length,
+      todaySales,
       todayRevenue
     });
   } catch (error) {
@@ -5386,7 +5444,12 @@ app.post('/raffles/:id/manual-payments', authenticateToken, async (req, res) => 
     const raffle = await prisma.raffle.findUnique({ where: { id: Number(id) } });
     if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
 
-    const amount = Number(raffle.ticketPrice) * Number(quantity);
+    const ticketPrice = Number(raffle.ticketPrice);
+    if (!Number.isFinite(ticketPrice) || ticketPrice <= 0) {
+      return res.status(400).json({ error: 'Esta rifa no tiene un precio válido para cobrar pagos manuales' });
+    }
+
+    const amount = ticketPrice * Number(quantity);
 
     const transaction = await prisma.transaction.create({
       data: {
@@ -6389,12 +6452,26 @@ app.get('/admin/transactions/verify/:txCode', authenticateToken, authorizeRole([
 // Listar pagos manuales (permite filtrar y normaliza el proof para mostrar la imagen)
 app.get('/admin/manual-payments', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
   try {
+    const actorRole = String(req.user?.role || '').toLowerCase();
+    const actorId = req.user?.userId;
     const { raffleId, status, reference } = req.query;
     const where = { type: 'manual_payment' };
     if (status) where.status = status;
     else where.status = 'pending';
     if (raffleId) where.raffleId = Number(raffleId);
     if (reference) where.reference = { contains: reference, mode: 'insensitive' };
+
+    // Admin: limitar a sus rifas. Superadmin: ve todo.
+    if (actorRole !== 'superadmin') {
+      const own = await prisma.raffle.findMany({ where: { userId: actorId }, select: { id: true } });
+      const ownIds = own.map((r) => r.id);
+      if (!ownIds.length) return res.json([]);
+      if (where.raffleId) {
+        if (!ownIds.includes(where.raffleId)) return res.json([]);
+      } else {
+        where.raffleId = { in: ownIds };
+      }
+    }
 
     const payments = await prisma.transaction.findMany({
       where,
@@ -6440,14 +6517,31 @@ app.post('/admin/manual-payments/:id/approve', authenticateToken, authorizeRole(
   const { id } = req.params;
 
   try {
+    const actorRole = String(req.user?.role || '').toLowerCase();
+    const actorId = req.user?.userId;
+
     const payment = await prisma.transaction.findUnique({ where: { id: Number(id) } });
     if (!payment) return res.status(404).json({ error: 'Pago no encontrado' });
     if (payment.status !== 'pending') return res.status(400).json({ error: 'El pago ya fue procesado' });
 
     if (!payment.raffleId) return res.status(400).json({ error: 'Pago sin rifa asociada' });
     const raffle = await prisma.raffle.findUnique({ where: { id: payment.raffleId } });
+
+    if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
+    if (actorRole !== 'superadmin' && raffle.userId !== actorId) {
+      return res.status(403).json({ error: 'No puedes aprobar pagos de rifas de otros admins' });
+    }
+
+    const ticketPrice = Number(raffle.ticketPrice);
+    const totalTickets = Number(raffle.totalTickets);
+    if (!Number.isFinite(ticketPrice) || ticketPrice <= 0) {
+      return res.status(400).json({ error: 'La rifa tiene un precio inválido. Corrige el precio antes de aprobar pagos.' });
+    }
+    if (!Number.isFinite(totalTickets) || totalTickets <= 0) {
+      return res.status(400).json({ error: 'La rifa tiene totalTickets inválido. Corrige la rifa antes de aprobar pagos.' });
+    }
     
-    const quantity = Math.floor(payment.amount / raffle.ticketPrice);
+    const quantity = Math.floor(Number(payment.amount) / ticketPrice);
     if (quantity <= 0) return res.status(400).json({ error: 'Monto insuficiente para un ticket' });
 
     const soldTickets = await prisma.ticket.findMany({
@@ -6459,7 +6553,7 @@ app.post('/admin/manual-payments/:id/approve', authenticateToken, authorizeRole(
     const assignedNumbers = [];
     let attempts = 0;
     while (assignedNumbers.length < quantity && attempts < quantity * 100) {
-      const num = Math.floor(Math.random() * raffle.totalTickets) + 1;
+      const num = Math.floor(Math.random() * totalTickets) + 1;
       if (!soldSet.has(num) && !assignedNumbers.includes(num)) {
         assignedNumbers.push(num);
       }
