@@ -914,6 +914,12 @@ function parse2faToken(token) {
   return { code, expiresAtMs };
 }
 
+function redactUserForResponse(user) {
+  if (!user || typeof user !== 'object') return user;
+  const { password: _pw, ...rest } = user;
+  return rest;
+}
+
 function generateSecurityId() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let result = 'MR-';
@@ -2035,7 +2041,8 @@ const handleLogin = async (req, res) => {
 
   // 2FA para admins/superadmin (por correo). Se controla con ADMIN_2FA (default: true).
   const admin2faEnv = String(process.env.ADMIN_2FA || '').toLowerCase();
-  const admin2faEnabled = admin2faEnv !== 'false';
+  // Seguridad: por defecto 2FA desactivado. Activar con ADMIN_2FA=true.
+  const admin2faEnabled = admin2faEnv === 'true';
   const isPrivileged = user.role === 'admin' || user.role === 'superadmin';
   if (admin2faEnabled && isPrivileged) {
     const ttlMinutes = Number(process.env.TWOFA_TTL_MINUTES || 10);
@@ -5443,6 +5450,91 @@ app.post('/superadmin/users', authenticateToken, authorizeRole(['superadmin']), 
     res.status(201).json(user);
   } catch (error) {
     res.status(500).json({ error: 'Error al crear usuario' });
+  }
+});
+
+// Superadmin: eliminar/anonomizar usuario por email (evita problemas de integridad referencial)
+// - Por defecto: soft delete (anónimo + desactivado)
+// - Opcional: hardDelete=true (si falla por FK, hace fallback a soft delete)
+app.post('/superadmin/users/delete-by-email', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    const hardDelete = req.body?.hardDelete === true;
+    if (!email || !email.includes('@')) return res.status(400).json({ error: 'Email inválido' });
+
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+    if (user.role === 'superadmin') return res.status(403).json({ error: 'No se puede eliminar un superadmin' });
+
+    const actorId = req.user?.userId;
+    const actorEmail = req.user?.email;
+
+    if (hardDelete) {
+      try {
+        await prisma.user.delete({ where: { email } });
+        try {
+          await prisma.auditLog.create({
+            data: {
+              action: 'SUPERADMIN_HARD_DELETE_USER_BY_EMAIL',
+              userId: actorId,
+              userEmail: actorEmail,
+              entity: 'User',
+              entityId: String(user.id),
+              detail: `Hard deleted user by email: ${email}`,
+              ipAddress: String(req.ip || ''),
+              userAgent: String(req.headers['user-agent'] || ''),
+              severity: 'CRITICAL'
+            }
+          });
+        } catch (_e) {}
+        return res.json({ ok: true, mode: 'hard', message: 'Usuario eliminado', userId: user.id, email });
+      } catch (e) {
+        console.warn('[SUPERADMIN][delete-by-email] hard delete failed, falling back to soft delete:', e?.message || e);
+      }
+    }
+
+    // Soft delete/anonymize
+    const updated = await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        name: 'Usuario Eliminado',
+        email: `deleted_${user.id}_${Date.now()}@megarifas.deleted`,
+        password: await bcrypt.hash(uuidv4(), 10),
+        active: false,
+        verified: false,
+        phone: null,
+        address: null,
+        cedula: null,
+        pushToken: null,
+        socials: {},
+        bankDetails: {},
+        bio: null,
+        avatar: null,
+        securityId: null,
+        verificationToken: null
+      }
+    });
+
+    try {
+      await prisma.auditLog.create({
+        data: {
+          action: 'SUPERADMIN_SOFT_DELETE_USER_BY_EMAIL',
+          userId: actorId,
+          userEmail: actorEmail,
+          entity: 'User',
+          entityId: String(user.id),
+          detail: `Soft deleted user by email: ${email}`,
+          ipAddress: String(req.ip || ''),
+          userAgent: String(req.headers['user-agent'] || ''),
+          severity: 'WARN'
+        }
+      });
+    } catch (_e) {}
+
+    return res.json({ ok: true, mode: 'soft', message: 'Usuario eliminado (anónimo)', user: redactUserForResponse(updated) });
+  } catch (error) {
+    console.error('[SUPERADMIN][delete-by-email] error:', error);
+    return res.status(500).json({ error: 'Error al eliminar usuario' });
   }
 });
 
