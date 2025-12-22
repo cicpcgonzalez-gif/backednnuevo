@@ -4209,6 +4209,51 @@ app.get('/winners', async (req, res) => {
   }
 });
 
+// Feed para ticker: ganadores por "instant wins" (drawSlot = instant:<num>) en rifas activas
+app.get('/feed/instant-wins', authenticateToken, async (req, res) => {
+  try {
+    const take = Math.min(Math.max(Number(req.query.take) || 50, 1), 200);
+    const winners = await prisma.winner.findMany({
+      where: {
+        drawSlot: { startsWith: 'instant:' },
+        raffle: { is: { status: 'active' } }
+      },
+      include: {
+        raffle: { select: { id: true, title: true } },
+        user: { select: { id: true, name: true, avatar: true } }
+      },
+      orderBy: { drawDate: 'desc' },
+      take
+    });
+
+    const mapped = (Array.isArray(winners) ? winners : []).map((w) => {
+      const u = w.user || null;
+      const r = w.raffle || null;
+      return {
+        id: w.id,
+        raffleId: w.raffleId,
+        drawSlot: w.drawSlot,
+        ticketNumber: w.ticketNumber,
+        prize: w.prize,
+        drawDate: w.drawDate,
+        raffle: r ? { id: r.id, title: r.title } : { id: w.raffleId, title: null },
+        user: u
+          ? {
+              id: u.id,
+              name: u.name ? safeDecrypt(u.name) : u.name,
+              avatar: u.avatar
+            }
+          : null
+      };
+    });
+
+    res.json(mapped);
+  } catch (error) {
+    console.error('[GET /feed/instant-wins]', error);
+    res.status(500).json({ error: 'Error al obtener feed de ganadores bendecidos' });
+  }
+});
+
 // --- ADMIN ANNOUNCEMENTS ---
 
 
