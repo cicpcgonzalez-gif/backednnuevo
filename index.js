@@ -242,6 +242,32 @@ function parseInstantWinNumbers(style) {
   return [];
 }
 
+function toFiniteNumber(value) {
+  if (value == null) return null;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'bigint') return Number(value);
+  if (typeof value === 'string') {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+  if (typeof value === 'object') {
+    try {
+      // Prisma.Decimal u otros tipos pueden soportar toNumber/toString
+      if (typeof value.toNumber === 'function') {
+        const n = value.toNumber();
+        return Number.isFinite(n) ? n : null;
+      }
+      if (typeof value.toString === 'function') {
+        const n = Number(value.toString());
+        return Number.isFinite(n) ? n : null;
+      }
+    } catch (_e) {
+      return null;
+    }
+  }
+  return null;
+}
+
 async function closeRaffleInternal(raffleId, reason = 'system_time_endDate') {
   const raffle = await prisma.raffle.findUnique({ where: { id: raffleId } });
   if (!raffle) return { ok: false, code: 404, error: 'Rifa no encontrada' };
@@ -2519,7 +2545,7 @@ app.get('/me/raffles', authenticateToken, async (req, res) => {
           where: {
             userId: actorUserId,
             raffleId: { in: raffleIds },
-            type: 'purchase'
+            OR: [{ type: 'purchase' }, { type: 'manual_payment' }]
           },
           orderBy: { createdAt: 'asc' }
         })
@@ -2533,13 +2559,18 @@ app.get('/me/raffles', authenticateToken, async (req, res) => {
         purchaseByRaffle[rid] = {
           totalSpent: 0,
           purchasedAt: null,
-          method: null
+          method: null,
+          unitPrice: null,
+          status: null
         };
       }
-      const amount = Number(p.amount);
-      if (Number.isFinite(amount)) purchaseByRaffle[rid].totalSpent += amount;
+      const amount = toFiniteNumber(p.amount);
+      if (amount != null) purchaseByRaffle[rid].totalSpent += amount;
+
+      // Preferir la info más reciente
       purchaseByRaffle[rid].purchasedAt = p.createdAt;
       purchaseByRaffle[rid].method = p.provider || purchaseByRaffle[rid].method;
+      purchaseByRaffle[rid].status = p.status || purchaseByRaffle[rid].status;
     }
 
     const grouped = {};
@@ -2564,13 +2595,32 @@ app.get('/me/raffles', authenticateToken, async (req, res) => {
           resultsPublished: !!result.resultsPublished,
           hasInstantWin: !!result.hasInstantWin,
           createdAt: t.createdAt,
-          payment: purchaseByRaffle[t.raffleId] || { totalSpent: null, purchasedAt: null, method: null }
+          payment: purchaseByRaffle[t.raffleId] || { totalSpent: null, purchasedAt: null, method: null, unitPrice: null, status: null }
         };
       }
       grouped[t.raffleId].numbers.push(t.number);
       // La fecha/hora más útil para el usuario es la del último ticket de esa rifa (aprox. última compra)
       if (t.createdAt && (!grouped[t.raffleId].createdAt || t.createdAt > grouped[t.raffleId].createdAt)) {
         grouped[t.raffleId].createdAt = t.createdAt;
+      }
+    }
+
+    // Fallback fuerte: si hay tickets pero el totalSpent quedó 0/null por data vieja o Decimal,
+    // calcular total con ticketPrice*cantidad para que el recibo sea correcto.
+    for (const rid of Object.keys(grouped)) {
+      const entry = grouped[rid];
+      const qty = Array.isArray(entry?.numbers) ? entry.numbers.length : 0;
+      const unitPrice = toFiniteNumber(entry?.raffle?.ticketPrice) ?? toFiniteNumber(entry?.raffle?.price);
+
+      if (entry?.payment && entry.payment.unitPrice == null && unitPrice != null) {
+        entry.payment.unitPrice = unitPrice;
+      }
+
+      const computedTotal = unitPrice != null && qty ? unitPrice * qty : null;
+      const currentTotal = entry?.payment ? toFiniteNumber(entry.payment.totalSpent) : null;
+
+      if (computedTotal != null && (currentTotal == null || currentTotal === 0)) {
+        entry.payment.totalSpent = computedTotal;
       }
     }
 
@@ -5327,7 +5377,7 @@ app.get('/users/public/:id', async (req, res) => {
 // Crear pago manual
 app.post('/raffles/:id/manual-payments', authenticateToken, async (req, res) => {
   const { id } = req.params;
-  const { quantity, reference, note, proof } = req.body;
+  const { quantity, provider, reference, note, proof } = req.body;
   
   if (!quantity || quantity <= 0) return res.status(400).json({ error: 'Cantidad inválida' });
   if (!proof) return res.status(400).json({ error: 'Comprobante requerido' });
@@ -5344,6 +5394,7 @@ app.post('/raffles/:id/manual-payments', authenticateToken, async (req, res) => 
         amount,
         type: 'manual_payment',
         status: 'pending',
+        provider: provider ? String(provider) : null,
         reference: encrypt(reference || `Pago manual para rifa ${id}`),
         proof: encrypt(proof),
         raffleId: raffle.id
