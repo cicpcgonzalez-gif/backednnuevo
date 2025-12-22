@@ -1761,7 +1761,9 @@ app.post('/register', async (req, res) => {
     return res.status(400).json({ error: 'Estado inválido, selecciona un estado de Venezuela' });
   }
   const hashedPassword = await bcrypt.hash(password, 10);
-  const verificationToken = generateVerificationCode();
+  // Usuarios normales: sin verificación por código (según requerimiento)
+  const autoVerifyUsers = true;
+  const verificationToken = autoVerifyUsers ? null : generateVerificationCode();
 
   try {
     let referredById = null;
@@ -1779,16 +1781,16 @@ app.post('/register', async (req, res) => {
     }
 
     const user = await prisma.user.create({
-      data: { 
-        email: safeEmail, 
-        name: encrypt(fullName), 
+      data: {
+        email: safeEmail,
+        name: encrypt(fullName),
         state: normalizedState,
         password: hashedPassword,
         publicId: generateShortId('USR'),
         securityId,
         referredById,
         verificationToken,
-        verified: false
+        verified: autoVerifyUsers ? true : false
       }
     });
 
@@ -1797,25 +1799,26 @@ app.post('/register', async (req, res) => {
       checkAndRewardReferrer(referredById).catch(console.error);
     }
     
-    // Enviar correo de bienvenida con token
-    const emailDisplayName = fullName || 'Usuario';
-    const sent = await sendEmail(
-      safeEmail,
-      'Activa tu cuenta en MegaRifas', 
-      `Hola ${emailDisplayName}, tu código de verificación es: ${verificationToken}`,
-      `<h1>¡Bienvenido a MegaRifas!</h1>
-       <p>Hola <b>${escapeHtml(emailDisplayName)}</b>,</p>
-       <p>Gracias por registrarte. Para activar tu cuenta, usa el siguiente código:</p>
-       <h2 style="color: #4f46e5; letter-spacing: 5px;">${verificationToken}</h2>
-       <p>Si no solicitaste esta cuenta, ignora este correo.</p>`
-    );
-
-    // Si el envío falló, no bloqueamos el registro; el usuario puede reintentar con /auth/verify/resend.
-    if (!sent) {
-      console.warn('[REGISTER] No se pudo enviar el correo de verificación a', safeEmail);
+    // Si no usamos verificación por correo para usuarios normales, enviamos correo opcional de bienvenida (sin código)
+    let sent = null;
+    if (!autoVerifyUsers) {
+      const emailDisplayName = fullName || 'Usuario';
+      sent = await sendEmail(
+        safeEmail,
+        'Activa tu cuenta en MegaRifas',
+        `Hola ${emailDisplayName}, tu código de verificación es: ${verificationToken}`,
+        `<h1>¡Bienvenido a MegaRifas!</h1>
+         <p>Hola <b>${escapeHtml(emailDisplayName)}</b>,</p>
+         <p>Gracias por registrarte. Para activar tu cuenta, usa el siguiente código:</p>
+         <h2 style="color: #4f46e5; letter-spacing: 5px;">${verificationToken}</h2>
+         <p>Si no solicitaste esta cuenta, ignora este correo.</p>`
+      );
+      if (!sent) console.warn('[REGISTER] No se pudo enviar el correo de verificación a', safeEmail);
+      return res.status(201).json({ message: 'Usuario registrado. Verifique su correo.', user, emailSent: sent });
     }
 
-    res.status(201).json({ message: 'Usuario registrado. Verifique su correo.', user, emailSent: sent });
+    // autoVerifyUsers=true
+    return res.status(201).json({ message: 'Usuario registrado.', user, emailSent: sent });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Error al registrar usuario' });
@@ -1942,7 +1945,7 @@ app.post('/auth/refresh', async (req, res) => {
 
     const user = await prisma.user.findUnique({ where: { id: Number(payload.userId) } });
     if (!user) return res.status(401).json({ error: 'Usuario no encontrado' });
-    if (!user.verified) return res.status(403).json({ error: 'Cuenta no verificada' });
+    if (!user.verified && user.role !== 'user') return res.status(403).json({ error: 'Cuenta no verificada' });
     if (user.active === false) return res.status(403).json({ error: 'Cuenta desactivada' });
 
     const accessToken = signAccessToken(user);
@@ -1983,6 +1986,16 @@ const handleLogin = async (req, res) => {
   if (!user.verified) {
     if (user.email === SUPERADMIN_EMAIL) {
       await prisma.user.update({ where: { id: user.id }, data: { verified: true } });
+      user.verified = true;
+    } else if (user.role === 'user') {
+      // Usuarios normales: sin verificación por código
+      try {
+        await prisma.user.update({ where: { id: user.id }, data: { verified: true, verificationToken: null } });
+        user.verified = true;
+        user.verificationToken = null;
+      } catch (_e) {
+        // no bloquear login
+      }
     } else {
       return res.status(403).json({ error: 'Cuenta no verificada. Revise su correo.' });
     }
