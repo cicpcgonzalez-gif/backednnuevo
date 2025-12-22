@@ -895,6 +895,25 @@ function generateVerificationCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
+function normalizeEmail(value) {
+  return String(value || '').toLowerCase().trim();
+}
+
+function build2faToken(code, expiresAtMs) {
+  return `2fa:${String(code || '').trim()}:${Number(expiresAtMs)}`;
+}
+
+function parse2faToken(token) {
+  const raw = String(token || '');
+  if (!raw.startsWith('2fa:')) return null;
+  const parts = raw.split(':');
+  if (parts.length !== 3) return null;
+  const code = parts[1];
+  const expiresAtMs = Number(parts[2]);
+  if (!code || !Number.isFinite(expiresAtMs)) return null;
+  return { code, expiresAtMs };
+}
+
 function generateSecurityId() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let result = 'MR-';
@@ -1710,7 +1729,7 @@ const amlService = require('./services/amlService');
 app.post('/register', async (req, res) => {
   // Admitimos firstName/lastName desde el cliente y los combinamos en name
   const { email, name, password, referralCode, firstName, lastName, state, cedula } = req.body || {};
-  const safeEmail = (email || '').toLowerCase().trim();
+  const safeEmail = normalizeEmail(email);
   const fullName = (name || `${firstName || ''} ${lastName || ''}`).trim();
   const safeState = (state || '').trim();
 
@@ -1773,18 +1792,24 @@ app.post('/register', async (req, res) => {
     }
     
     // Enviar correo de bienvenida con token
-    sendEmail(
-      email, 
+    const emailDisplayName = fullName || 'Usuario';
+    const sent = await sendEmail(
+      safeEmail,
       'Activa tu cuenta en MegaRifas', 
-      `Hola ${name}, tu código de verificación es: ${verificationToken}`,
+      `Hola ${emailDisplayName}, tu código de verificación es: ${verificationToken}`,
       `<h1>¡Bienvenido a MegaRifas!</h1>
-       <p>Hola <b>${name}</b>,</p>
+       <p>Hola <b>${escapeHtml(emailDisplayName)}</b>,</p>
        <p>Gracias por registrarte. Para activar tu cuenta, usa el siguiente código:</p>
        <h2 style="color: #4f46e5; letter-spacing: 5px;">${verificationToken}</h2>
        <p>Si no solicitaste esta cuenta, ignora este correo.</p>`
-    ).catch(console.error);
+    );
 
-    res.status(201).json({ message: 'Usuario registrado. Verifique su correo.', user });
+    // Si el envío falló, no bloqueamos el registro; el usuario puede reintentar con /auth/verify/resend.
+    if (!sent) {
+      console.warn('[REGISTER] No se pudo enviar el correo de verificación a', safeEmail);
+    }
+
+    res.status(201).json({ message: 'Usuario registrado. Verifique su correo.', user, emailSent: sent });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Error al registrar usuario' });
@@ -1796,8 +1821,10 @@ app.post('/verify-email', async (req, res) => {
   const { email, code } = req.body;
   if (!email || !code) return res.status(400).json({ error: 'Faltan datos' });
 
+  const safeEmail = normalizeEmail(email);
+
   try {
-    const user = await prisma.user.findUnique({ where: { email } });
+    const user = await prisma.user.findUnique({ where: { email: safeEmail } });
     if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
 
     if (user.verified) return res.json({ message: 'Cuenta ya verificada' });
@@ -1807,7 +1834,7 @@ app.post('/verify-email', async (req, res) => {
     }
 
     await prisma.user.update({
-      where: { email },
+      where: { email: safeEmail },
       data: { verified: true, verificationToken: null }
     });
 
@@ -1822,23 +1849,29 @@ async function resendVerificationCodeHandler(req, res) {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Email requerido' });
 
+  const safeEmail = normalizeEmail(email);
+
   try {
-    const user = await prisma.user.findUnique({ where: { email } });
+    const user = await prisma.user.findUnique({ where: { email: safeEmail } });
     if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
     if (user.verified) return res.status(400).json({ error: 'Usuario ya verificado' });
 
     const verificationToken = generateVerificationCode();
     await prisma.user.update({
-      where: { email },
+      where: { email: safeEmail },
       data: { verificationToken }
     });
 
-    await sendEmail(
-      email,
+    const sent = await sendEmail(
+      safeEmail,
       'Reenvío de Código de Verificación',
       `Tu nuevo código es: ${verificationToken}`,
       `<h1>Código de Verificación</h1><p>Tu nuevo código es:</p><h2>${verificationToken}</h2>`
     );
+
+    if (!sent) {
+      return res.status(502).json({ error: 'No se pudo enviar el correo. Intenta nuevamente.' });
+    }
 
     return res.json({ message: 'Código reenviado exitosamente' });
   } catch (error) {
@@ -1857,8 +1890,10 @@ app.post('/auth/password/reset/request', async (req, res) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Email requerido' });
 
+  const safeEmail = normalizeEmail(email);
+
   try {
-    const user = await prisma.user.findUnique({ where: { email } });
+    const user = await prisma.user.findUnique({ where: { email: safeEmail } });
 
     // Evitar enumeración de usuarios: respondemos OK aunque no exista.
     if (!user) {
@@ -1866,7 +1901,7 @@ app.post('/auth/password/reset/request', async (req, res) => {
     }
 
     const webBaseUrl = String(process.env.WEB_BASE_URL || '').trim();
-    const resetToken = jwt.sign({ email, purpose: 'password_reset' }, JWT_SECRET, { expiresIn: '15m' });
+    const resetToken = jwt.sign({ email: safeEmail, purpose: 'password_reset' }, JWT_SECRET, { expiresIn: '15m' });
     const resetLink = webBaseUrl ? `${webBaseUrl.replace(/\/$/, '')}/recuperar?token=${encodeURIComponent(resetToken)}` : null;
 
     const subject = 'Recuperación de contraseña - MegaRifas';
@@ -1877,7 +1912,10 @@ app.post('/auth/password/reset/request', async (req, res) => {
       ? `<h1>Recuperación de contraseña</h1><p>Para recuperar tu contraseña, haz clic aquí (válido por 15 minutos):</p><p><a href="${escapeHtml(resetLink)}">Recuperar contraseña</a></p>`
       : '<h1>Recuperación de contraseña</h1><p>Solicitaste recuperación de contraseña. Contacta a soporte o intenta nuevamente más tarde.</p>';
 
-    await sendEmail(email, subject, text, html).catch(console.error);
+    const sent = await sendEmail(safeEmail, subject, text, html);
+    if (!sent) {
+      return res.status(502).json({ error: 'No se pudo enviar el correo. Intenta nuevamente.' });
+    }
     return res.json({ message: 'Hemos enviado instrucciones a tu correo.' });
   } catch (error) {
     console.error('Password reset request error:', error);
@@ -1920,7 +1958,8 @@ const handleLogin = async (req, res) => {
   if (!email || !password) {
     return res.status(400).json({ error: 'Faltan datos requeridos' });
   }
-  const user = await prisma.user.findUnique({ where: { email } });
+  const safeEmail = normalizeEmail(email);
+  const user = await prisma.user.findUnique({ where: { email: safeEmail } });
   if (!user) return res.status(401).json({ error: 'Usuario no encontrado' });
 
   // Asegurar ID identificativo (securityId) único para confianza
@@ -1994,6 +2033,33 @@ const handleLogin = async (req, res) => {
   if (userWithoutPassword.name) userWithoutPassword.name = decrypt(userWithoutPassword.name);
   if (userWithoutPassword.bankDetails) userWithoutPassword.bankDetails = JSON.parse(decrypt(JSON.stringify(userWithoutPassword.bankDetails)));
 
+  // 2FA para admins/superadmin (por correo). Se controla con ADMIN_2FA (default: true).
+  const admin2faEnv = String(process.env.ADMIN_2FA || '').toLowerCase();
+  const admin2faEnabled = admin2faEnv !== 'false';
+  const isPrivileged = user.role === 'admin' || user.role === 'superadmin';
+  if (admin2faEnabled && isPrivileged) {
+    const ttlMinutes = Number(process.env.TWOFA_TTL_MINUTES || 10);
+    const expiresAtMs = Date.now() + (Number.isFinite(ttlMinutes) && ttlMinutes > 0 ? ttlMinutes : 10) * 60_000;
+    const code = generateVerificationCode();
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { verificationToken: build2faToken(code, expiresAtMs) }
+    });
+
+    const displayName = userWithoutPassword?.name ? String(userWithoutPassword.name) : 'Administrador';
+    const subject = 'Código de seguridad - MegaRifas';
+    const text = `Hola ${displayName}. Tu código de seguridad es: ${code}. Vence en ${ttlMinutes} minutos.`;
+    const html = `<h1>Código de seguridad</h1><p>Hola <b>${escapeHtml(displayName)}</b>,</p><p>Tu código de seguridad es:</p><h2 style="letter-spacing: 6px;">${code}</h2><p>Vence en ${Number.isFinite(ttlMinutes) ? ttlMinutes : 10} minutos.</p>`;
+
+    const sent = await sendEmail(safeEmail, subject, text, html);
+    if (!sent) {
+      return res.status(502).json({ error: 'No se pudo enviar el código de seguridad. Intenta de nuevo.' });
+    }
+
+    return res.json({ require2FA: true, email: safeEmail, message: 'Código enviado al correo' });
+  }
+
   // Adaptar respuesta para que coincida con lo que espera la App móvil (accessToken + refreshToken)
   res.json({ message: 'Login exitoso', token, accessToken: token, refreshToken, user: userWithoutPassword });
 };
@@ -2006,13 +2072,41 @@ app.post('/auth/2fa', async (req, res) => {
   const { email, code } = req.body;
   if (!email || !code) return res.status(400).json({ error: 'Faltan datos' });
 
-  const user = await prisma.user.findUnique({ where: { email } });
+  const safeEmail = normalizeEmail(email);
+  const user = await prisma.user.findUnique({ where: { email: safeEmail } });
   if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
 
-  if (user.verificationToken !== code) {
+  const token = user.verificationToken;
+  const parsed2fa = parse2faToken(token);
+  if (parsed2fa) {
+    if (String(code) !== parsed2fa.code) {
+      await securityLogger.log({
+        action: '2FA_FAILED',
+        userEmail: safeEmail,
+        userId: user.id,
+        ipAddress: req.ip,
+        userAgent: req.headers['user-agent'],
+        severity: 'WARN',
+        detail: 'Invalid 2FA code'
+      });
+      return res.status(400).json({ error: 'Código inválido' });
+    }
+    if (Date.now() > parsed2fa.expiresAtMs) {
+      await securityLogger.log({
+        action: '2FA_FAILED',
+        userEmail: safeEmail,
+        userId: user.id,
+        ipAddress: req.ip,
+        userAgent: req.headers['user-agent'],
+        severity: 'WARN',
+        detail: 'Expired 2FA code'
+      });
+      return res.status(400).json({ error: 'Código expirado. Solicita uno nuevo.' });
+    }
+  } else if (token !== code) {
     await securityLogger.log({
       action: '2FA_FAILED',
-      userEmail: email,
+      userEmail: safeEmail,
       userId: user.id,
       ipAddress: req.ip,
       userAgent: req.headers['user-agent'],
@@ -2030,7 +2124,7 @@ app.post('/auth/2fa', async (req, res) => {
 
   await securityLogger.log({
     action: '2FA_SUCCESS',
-    userEmail: email,
+    userEmail: safeEmail,
     userId: user.id,
     ipAddress: req.ip,
     userAgent: req.headers['user-agent'],
