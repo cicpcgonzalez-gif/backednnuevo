@@ -2096,8 +2096,8 @@ app.post('/auth/2fa', async (req, res) => {
   const user = await prisma.user.findUnique({ where: { email: safeEmail } });
   if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
 
-  const token = user.verificationToken;
-  const parsed2fa = parse2faToken(token);
+  const verificationTokenRaw = user.verificationToken;
+  const parsed2fa = parse2faToken(verificationTokenRaw);
   if (parsed2fa) {
     if (String(code) !== parsed2fa.code) {
       await securityLogger.log({
@@ -2123,7 +2123,7 @@ app.post('/auth/2fa', async (req, res) => {
       });
       return res.status(400).json({ error: 'Código expirado. Solicita uno nuevo.' });
     }
-  } else if (token !== code) {
+  } else if (verificationTokenRaw !== code) {
     await securityLogger.log({
       action: '2FA_FAILED',
       userEmail: safeEmail,
