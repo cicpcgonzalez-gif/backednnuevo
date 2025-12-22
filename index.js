@@ -1165,7 +1165,11 @@ app.get('/raffles', async (req, res) => {
           id: true,
           title: true,
           prize: true,
+          instantWins: true,
+          digits: true,
           totalTickets: true,
+          endDate: true,
+          startDate: true,
           createdAt: true,
           style: true,
           user: {
@@ -1274,7 +1278,11 @@ app.get('/raffles/:id', async (req, res) => {
           id: true,
           title: true,
           prize: true,
+          instantWins: true,
+          digits: true,
           totalTickets: true,
+          endDate: true,
+          startDate: true,
           createdAt: true,
           style: true,
           user: {
