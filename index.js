@@ -469,6 +469,83 @@ function authenticateToken(req, res, next) {
   });
 }
 
+// Auth opcional: si hay token válido, adjunta req.user; si no, continúa sin bloquear.
+function attachUserIfTokenPresent(req, _res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return next();
+  try {
+    const user = jwt.verify(token, JWT_SECRET);
+    req.user = user;
+  } catch (_e) {
+    // Ignorar token inválido en rutas públicas
+  }
+  next();
+}
+
+async function enrichRafflesWithReactions(raffles, userId) {
+  const list = Array.isArray(raffles) ? raffles : [];
+  const ids = list
+    .map((r) => Number(r?.id))
+    .filter((x) => Number.isFinite(x) && x > 0);
+
+  if (!ids.length) return list;
+
+  const countsMap = new Map();
+  const myMap = new Map();
+
+  try {
+    const idsCsv = ids.join(',');
+    const rows = await prisma.$queryRawUnsafe(
+      `SELECT "raffleId", "type", COUNT(*)::int AS "count" FROM "RaffleReaction" WHERE "raffleId" IN (${idsCsv}) GROUP BY "raffleId", "type"`
+    );
+    const arr = Array.isArray(rows) ? rows : [];
+    for (const row of arr) {
+      const raffleId = Number(row?.raffleId);
+      if (!Number.isFinite(raffleId)) continue;
+      if (!countsMap.has(raffleId)) countsMap.set(raffleId, { LIKE: 0, HEART: 0 });
+      const type = String(row?.type || '').toUpperCase();
+      const count = Number(row?.count);
+      if (type === 'LIKE' || type === 'HEART') {
+        countsMap.get(raffleId)[type] = Number.isFinite(count) ? count : 0;
+      }
+    }
+
+    const uid = Number(userId);
+    if (Number.isFinite(uid) && uid > 0) {
+      const myRows = await prisma.$queryRawUnsafe(
+        `SELECT "raffleId", "type" FROM "RaffleReaction" WHERE "userId"=${uid} AND "raffleId" IN (${idsCsv})`
+      );
+      const myArr = Array.isArray(myRows) ? myRows : [];
+      for (const row of myArr) {
+        const raffleId = Number(row?.raffleId);
+        if (!Number.isFinite(raffleId)) continue;
+        const type = String(row?.type || '').toUpperCase();
+        if (type === 'LIKE' || type === 'HEART') myMap.set(raffleId, type);
+      }
+    }
+  } catch (error) {
+    if (!isPrismaMissingTableError(error)) {
+      console.error('[enrichRafflesWithReactions] error:', error);
+    }
+    // Si falta la tabla, devolvemos sin counts/reaction (compatibilidad)
+    return list.map((r) => ({
+      ...r,
+      reactionCounts: r?.reactionCounts || { LIKE: 0, HEART: 0 },
+      myReaction: r?.myReaction ?? null
+    }));
+  }
+
+  return list.map((r) => {
+    const rid = Number(r?.id);
+    return {
+      ...r,
+      reactionCounts: countsMap.get(rid) || { LIKE: 0, HEART: 0 },
+      myReaction: myMap.get(rid) || null
+    };
+  });
+}
+
 // Middleware de autorización por rol
 function authorizeRole(roles) {
   return (req, res, next) => {
@@ -1228,7 +1305,7 @@ app.get('/users/public/:id/raffles', authenticateToken, async (req, res) => {
 });
 
 // Endpoint para obtener todas las rifas
-app.get('/raffles', async (req, res) => {
+app.get('/raffles', attachUserIfTokenPresent, async (req, res) => {
   const start = Date.now();
   try {
     let raffles;
@@ -1330,7 +1407,8 @@ app.get('/raffles', async (req, res) => {
       return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
     });
 
-    res.json(decryptedRaffles);
+    const withReactions = await enrichRafflesWithReactions(decryptedRaffles, req.user?.userId);
+    res.json(withReactions);
   } catch (error) {
     console.error('[GET /raffles] Error:', error);
     res.status(500).json({ error: 'Error al obtener rifas' });
@@ -1338,7 +1416,7 @@ app.get('/raffles', async (req, res) => {
 });
 
 // Obtener una rifa por ID (usado por detalle en la app móvil)
-app.get('/raffles/:id', async (req, res) => {
+app.get('/raffles/:id', attachUserIfTokenPresent, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'ID inválido' });
@@ -1412,7 +1490,9 @@ app.get('/raffles/:id', async (req, res) => {
 
     const base = { ...raffle, soldTickets: raffle._count?.tickets || 0 };
     if (usedFallback && base.status == null) base.status = 'active';
-    return res.json(base);
+
+    const enriched = await enrichRafflesWithReactions([base], req.user?.userId);
+    return res.json(enriched[0] || base);
   } catch (error) {
     console.error(error);
     return res.status(500).json({ error: 'Error al obtener rifa' });
@@ -3906,7 +3986,9 @@ app.get('/admin/raffles', authenticateToken, authorizeRole(['admin', 'superadmin
     const actorId = req.user?.userId;
     const where = actorRole === 'superadmin' ? {} : { userId: actorId };
     const raffles = await prisma.raffle.findMany({ where, orderBy: { createdAt: 'desc' }, include: { _count: { select: { tickets: true } } } });
-    res.json(raffles.map(r => ({ ...r, soldTickets: r._count?.tickets || 0 })));
+    const base = raffles.map(r => ({ ...r, soldTickets: r._count?.tickets || 0 }));
+    const withReactions = await enrichRafflesWithReactions(base, actorId);
+    res.json(withReactions);
   } catch (error) {
     res.status(500).json({ error: 'Error al obtener rifas' });
   }
@@ -6584,7 +6666,7 @@ app.get('/users/public/:id', async (req, res) => {
 });
 
 // --- ANNOUNCEMENTS ---
-app.get('/announcements', async (req, res) => {
+app.get('/announcements', attachUserIfTokenPresent, async (req, res) => {
   try {
     const announcements = await prisma.announcement.findMany({
       orderBy: { createdAt: 'desc' },
@@ -6627,7 +6709,25 @@ app.get('/announcements', async (req, res) => {
       };
     });
 
-    res.json(decryptedAnnouncements);
+    const actorUserId = Number(req.user?.userId);
+    if (Number.isFinite(actorUserId) && actorUserId > 0) {
+      const ids = announcements.map((a) => a.id).filter((x) => Number.isFinite(Number(x)));
+      const my = ids.length
+        ? await prisma.reaction.findMany({
+            where: { userId: actorUserId, announcementId: { in: ids } },
+            select: { announcementId: true, type: true }
+          })
+        : [];
+      const myMap = new Map(my.map((r) => [r.announcementId, String(r.type || '').toUpperCase()]));
+      return res.json(
+        decryptedAnnouncements.map((a) => ({
+          ...a,
+          myReaction: myMap.get(a.id) || null
+        }))
+      );
+    }
+
+    res.json(decryptedAnnouncements.map((a) => ({ ...a, myReaction: null })));
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Error al obtener anuncios' });
