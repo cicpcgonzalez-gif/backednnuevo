@@ -899,6 +899,26 @@ function normalizeEmail(value) {
   return String(value || '').toLowerCase().trim();
 }
 
+function getTicketDigitsFromRaffle(raffle) {
+  const explicit = Number(raffle?.digits);
+  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+
+  const total = Number(raffle?.totalTickets);
+  // Para 10,000 queremos 4 (10^4) y para 1,000,000 queremos 6 (10^6)
+  // -> usar (totalTickets - 1) como referencia del máximo “rellenable”.
+  if (Number.isFinite(total) && total > 1) return String(total - 1).length;
+
+  return 4;
+}
+
+function formatTicketNumber(num, digits) {
+  const n = Number(num);
+  if (!Number.isFinite(n)) return String(num);
+  const d = Number(digits);
+  if (!Number.isFinite(d) || d <= 0) return String(n);
+  return String(n).padStart(d, '0');
+}
+
 function build2faToken(code, expiresAtMs) {
   return `2fa:${String(code || '').trim()}:${Number(expiresAtMs)}`;
 }
@@ -3062,11 +3082,13 @@ app.post('/tickets', authenticateToken, async (req, res) => {
     const ticket = result;
 
     if (ticket.user && ticket.user.email) {
+      const digits = getTicketDigitsFromRaffle(ticket.raffle);
+      const displayNumber = formatTicketNumber(ticket.number, digits);
       sendEmail(
         ticket.user.email,
         'Confirmación de Ticket - MegaRifas',
-        `Has comprado el ticket #${ticket.number} para la rifa ${ticket.raffle.title}. Serial: ${ticket.serialNumber}`,
-        `<h1>¡Ticket Confirmado!</h1><p>Has adquirido el número <b>${ticket.number}</b> para la rifa <i>${ticket.raffle.title}</i>.</p><p>Serial único: <code>${ticket.serialNumber}</code></p>`
+        `Has comprado el ticket #${displayNumber} para la rifa ${ticket.raffle.title}. Serial: ${ticket.serialNumber}`,
+        `<h1>¡Ticket Confirmado!</h1><p>Has adquirido el número <b>${displayNumber}</b> para la rifa <i>${ticket.raffle.title}</i>.</p><p>Serial único: <code>${ticket.serialNumber}</code></p>`
       ).catch(console.error);
     }
 
@@ -3197,15 +3219,25 @@ app.post('/admin/verify-payment/:transactionId', authenticateToken, authorizeRol
 
     // Notificar usuario
     if (transaction.user.email) {
+      const digits = getTicketDigitsFromRaffle(raffle);
+      const displayNumber = formatTicketNumber(ticket.number, digits);
       sendEmail(
         transaction.user.email,
         'Pago Aprobado - Ticket Asignado',
-        `Tu pago ha sido verificado. Tu número es: ${ticket.number}`,
-        `<h1>¡Pago Verificado!</h1><p>Tu número asignado es: <b>${ticket.number}</b></p><p>Rifa: ${raffle.title}</p>`
+        `Tu pago ha sido verificado. Tu número es: ${displayNumber}`,
+        `<h1>¡Pago Verificado!</h1><p>Tu número asignado es: <b>${displayNumber}</b></p><p>Rifa: ${raffle.title}</p>`
       ).catch(console.error);
     }
 
-    res.json({ message: 'Pago verificado y ticket asignado', ticket });
+    {
+      const digits = getTicketDigitsFromRaffle(raffle);
+      res.json({
+        message: 'Pago verificado y ticket asignado',
+        ticket,
+        ticketFormatted: formatTicketNumber(ticket.number, digits),
+        digits
+      });
+    }
 
   } catch (error) {
     console.error(error);
@@ -3221,7 +3253,7 @@ app.get('/verify-ticket/:serial', async (req, res) => {
       where: { serialNumber: serial },
       include: { 
         user: { select: { name: true, publicId: true } },
-        raffle: { select: { title: true } }
+        raffle: { select: { title: true, digits: true, totalTickets: true } }
       }
     });
 
@@ -3235,6 +3267,7 @@ app.get('/verify-ticket/:serial', async (req, res) => {
       ticket: {
         serialNumber: ticket.serialNumber,
         number: ticket.number,
+        displayNumber: formatTicketNumber(ticket.number, getTicketDigitsFromRaffle(ticket.raffle)),
         raffle: ticket.raffle.title,
         holder: ticket.user.name,
         signature: ticket.receiptSignature,
@@ -6879,15 +6912,25 @@ app.post('/admin/manual-payments/:id/approve', authenticateToken, authorizeRole(
 
     const user = await prisma.user.findUnique({ where: { id: payment.userId } });
     if (user) {
+      const digits = getTicketDigitsFromRaffle(raffle);
+      const assignedNumbersFormatted = assignedNumbers.map((n) => formatTicketNumber(n, digits));
       sendEmail(
         user.email,
         'Pago Aprobado - Tickets Asignados',
-        `Tu pago ha sido aprobado. Tus números son: ${assignedNumbers.join(', ')}`,
-        `<h1>¡Pago Aprobado!</h1><p>Gracias por tu compra.</p><p>Tus números de la suerte son:</p><h3>${assignedNumbers.join(', ')}</h3>`
+        `Tu pago ha sido aprobado. Tus números son: ${assignedNumbersFormatted.join(', ')}`,
+        `<h1>¡Pago Aprobado!</h1><p>Gracias por tu compra.</p><p>Tus números de la suerte son:</p><h3>${assignedNumbersFormatted.join(', ')}</h3>`
       ).catch(console.error);
     }
 
-    res.json({ message: 'Pago aprobado y tickets generados', tickets: assignedNumbers });
+    {
+      const digits = getTicketDigitsFromRaffle(raffle);
+      res.json({
+        message: 'Pago aprobado y tickets generados',
+        tickets: assignedNumbers,
+        ticketsFormatted: assignedNumbers.map((n) => formatTicketNumber(n, digits)),
+        digits
+      });
+    }
 
   } catch (error) {
     console.error(error);
