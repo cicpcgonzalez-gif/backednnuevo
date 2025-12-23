@@ -899,6 +899,19 @@ function normalizeEmail(value) {
   return String(value || '').toLowerCase().trim();
 }
 
+function getPublicBaseUrlFromRequest(req) {
+  try {
+    const xfProto = String(req?.headers?.['x-forwarded-proto'] || '').split(',')[0].trim();
+    const xfHost = String(req?.headers?.['x-forwarded-host'] || '').split(',')[0].trim();
+    const host = xfHost || String(req?.headers?.host || '').split(',')[0].trim();
+    const proto = xfProto || String(req?.protocol || '').trim() || 'https';
+    if (!host) return null;
+    return `${proto}://${host}`;
+  } catch (_e) {
+    return null;
+  }
+}
+
 function getTicketDigitsFromRaffle(raffle) {
   const explicit = Number(raffle?.digits);
   if (Number.isFinite(explicit) && explicit > 0) return explicit;
@@ -1914,7 +1927,7 @@ app.post('/resend-code', resendVerificationCodeHandler);
 app.post('/auth/verify/resend', resendVerificationCodeHandler);
 
 // Password reset (request) - endpoint esperado por la app móvil.
-// Nota: esta versión envía un correo informativo; no cambia contraseña directamente.
+// Nota: envía un enlace con token JWT y se confirma en /auth/password/reset/confirm.
 app.post('/auth/password/reset/request', async (req, res) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Email requerido' });
@@ -1930,16 +1943,18 @@ app.post('/auth/password/reset/request', async (req, res) => {
     }
 
     const webBaseUrl = String(process.env.WEB_BASE_URL || '').trim();
+    const fallbackBaseUrl = getPublicBaseUrlFromRequest(req);
     const resetToken = jwt.sign({ email: safeEmail, purpose: 'password_reset' }, JWT_SECRET, { expiresIn: '15m' });
-    const resetLink = webBaseUrl ? `${webBaseUrl.replace(/\/$/, '')}/recuperar?token=${encodeURIComponent(resetToken)}` : null;
+    const baseForLink = webBaseUrl || fallbackBaseUrl;
+    const resetLink = baseForLink ? `${baseForLink.replace(/\/$/, '')}/recuperar?token=${encodeURIComponent(resetToken)}` : null;
 
     const subject = 'Recuperación de contraseña - MegaRifas';
     const text = resetLink
       ? `Para recuperar tu contraseña, abre este enlace (válido por 15 minutos): ${resetLink}`
-      : 'Solicitaste recuperación de contraseña. Contacta a soporte o intenta nuevamente más tarde.';
+      : `Para recuperar tu contraseña necesitas este token (válido por 15 minutos): ${resetToken}`;
     const html = resetLink
-      ? `<h1>Recuperación de contraseña</h1><p>Para recuperar tu contraseña, haz clic aquí (válido por 15 minutos):</p><p><a href="${escapeHtml(resetLink)}">Recuperar contraseña</a></p>`
-      : '<h1>Recuperación de contraseña</h1><p>Solicitaste recuperación de contraseña. Contacta a soporte o intenta nuevamente más tarde.</p>';
+      ? `<h1>Recuperación de contraseña</h1><p>Para recuperar tu contraseña, haz clic aquí (válido por 15 minutos):</p><p><a href="${escapeHtml(resetLink)}">Recuperar contraseña</a></p><p style="color:#666;font-size:12px;">Si el enlace no abre, copia y pega en tu navegador.</p>`
+      : `<h1>Recuperación de contraseña</h1><p>No se pudo generar enlace automático.</p><p><b>Token (válido por 15 minutos):</b></p><p style="font-family:monospace;word-break:break-all;">${escapeHtml(resetToken)}</p>`;
 
     const sent = await sendEmail(safeEmail, subject, text, html);
     if (!sent) {
@@ -1949,6 +1964,137 @@ app.post('/auth/password/reset/request', async (req, res) => {
   } catch (error) {
     console.error('Password reset request error:', error);
     return res.status(500).json({ error: 'Error al solicitar recuperación' });
+  }
+});
+
+// Página simple de recuperación (sirve incluso si no hay WEB_BASE_URL)
+app.get('/recuperar', async (req, res) => {
+  try {
+    const token = String(req.query?.token || '').trim();
+    const safeToken = escapeHtml(token);
+    const html = `<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Recuperar contraseña</title>
+  </head>
+  <body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; max-width: 520px; margin: 40px auto; padding: 0 16px;">
+    <h1>Recuperación de contraseña</h1>
+    <p>Ingresa tu nueva contraseña. El enlace vence en 15 minutos.</p>
+    <form id="f" style="display:flex;flex-direction:column;gap:12px;">
+      <input type="hidden" id="token" value="${safeToken}" />
+      <label>
+        Nueva contraseña
+        <input id="p1" type="password" autocomplete="new-password" required minlength="6" style="width:100%;padding:10px;margin-top:6px;" />
+      </label>
+      <label>
+        Repetir contraseña
+        <input id="p2" type="password" autocomplete="new-password" required minlength="6" style="width:100%;padding:10px;margin-top:6px;" />
+      </label>
+      <button type="submit" style="padding:12px;">Guardar nueva contraseña</button>
+    </form>
+    <p id="msg" style="margin-top:16px;"></p>
+    <script>
+      const form = document.getElementById('f');
+      const msg = document.getElementById('msg');
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        msg.textContent = '';
+        const token = document.getElementById('token').value;
+        const p1 = document.getElementById('p1').value;
+        const p2 = document.getElementById('p2').value;
+        if (!token) {
+          msg.textContent = 'Falta el token. Abre el enlace del correo nuevamente.';
+          return;
+        }
+        if (p1.length < 6) {
+          msg.textContent = 'La contraseña debe tener al menos 6 caracteres.';
+          return;
+        }
+        if (p1 !== p2) {
+          msg.textContent = 'Las contraseñas no coinciden.';
+          return;
+        }
+        try {
+          const r = await fetch('/auth/password/reset/confirm', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token, newPassword: p1 })
+          });
+          const data = await r.json().catch(() => ({}));
+          if (!r.ok) {
+            msg.textContent = data && data.error ? data.error : 'No se pudo cambiar la contraseña.';
+            return;
+          }
+          msg.textContent = 'Contraseña actualizada. Ya puedes iniciar sesión en la app.';
+        } catch (err) {
+          msg.textContent = 'Error de red. Intenta nuevamente.';
+        }
+      });
+    </script>
+  </body>
+</html>`;
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(200).send(html);
+  } catch (e) {
+    return res.status(500).send('Error al cargar la página de recuperación');
+  }
+});
+
+// Confirmar recuperación: valida token JWT y actualiza password
+app.post('/auth/password/reset/confirm', async (req, res) => {
+  const token = String(req.body?.token || '').trim();
+  const newPassword = String(req.body?.newPassword || '').trim();
+
+  if (!token) return res.status(400).json({ error: 'Token requerido' });
+  if (!newPassword || newPassword.length < 6) {
+    return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
+  }
+
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    if (!payload || payload.purpose !== 'password_reset' || !payload.email) {
+      return res.status(400).json({ error: 'Token inválido' });
+    }
+
+    const safeEmail = normalizeEmail(payload.email);
+    const user = await prisma.user.findUnique({ where: { email: safeEmail } });
+    if (!user) {
+      // Mantener respuesta genérica
+      return res.status(400).json({ error: 'Token inválido' });
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    await prisma.user.update({
+      where: { email: safeEmail },
+      data: {
+        password: hashedPassword,
+        verificationToken: null,
+        verified: true,
+        active: true
+      }
+    });
+
+    try {
+      await securityLogger.log({
+        action: 'PASSWORD_RESET_SUCCESS',
+        userEmail: safeEmail,
+        userId: user.id,
+        ipAddress: String(req.headers['x-forwarded-for'] || req.socket?.remoteAddress || ''),
+        userAgent: String(req.headers['user-agent'] || ''),
+        severity: 'INFO',
+        detail: 'User reset password via token',
+        entity: 'User',
+        entityId: String(user.id)
+      });
+    } catch (_e) {
+      // no bloquear
+    }
+
+    return res.json({ message: 'Contraseña actualizada' });
+  } catch (_e) {
+    return res.status(400).json({ error: 'Token inválido o expirado' });
   }
 });
 
