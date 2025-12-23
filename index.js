@@ -2610,12 +2610,17 @@ app.post('/raffles/:id/purchase', authenticateToken, async (req, res) => {
       // no bloquear
     }
 
-    res.status(201).json({ 
-      message: 'Compra exitosa', 
-      numbers: newNumbers,
-      instantWinsAwarded,
-      remainingBalance: user.balance - totalCost 
-    });
+    {
+      const digits = getTicketDigitsFromRaffle(raffle);
+      res.status(201).json({
+        message: 'Compra exitosa',
+        numbers: newNumbers,
+        numbersFormatted: newNumbers.map((n) => formatTicketNumber(n, digits)),
+        digits,
+        instantWinsAwarded,
+        remainingBalance: user.balance - totalCost
+      });
+    }
 
     try {
       await securityLogger.log({
@@ -3092,7 +3097,15 @@ app.post('/tickets', authenticateToken, async (req, res) => {
       ).catch(console.error);
     }
 
-    res.status(201).json({ message: 'Ticket creado', ticket });
+    {
+      const digits = getTicketDigitsFromRaffle(ticket.raffle);
+      res.status(201).json({
+        message: 'Ticket creado',
+        ticket,
+        ticketFormatted: formatTicketNumber(ticket.number, digits),
+        digits
+      });
+    }
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Error al crear ticket' });
