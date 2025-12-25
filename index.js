@@ -1,6 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const { PrismaClient, Prisma } = require('@prisma/client');
+const fs = require('fs');
+const path = require('path');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const helmet = require('helmet');
@@ -9,6 +11,13 @@ const rateLimit = require('express-rate-limit');
 const compression = require('compression');
 const crypto = require('crypto');
 const multer = require('multer');
+let sharp = null;
+try {
+  // Optional en runtime, pero lo agregamos como dependencia para convertir avatar a WEBP.
+  sharp = require('sharp');
+} catch (_e) {
+  sharp = null;
+}
 const FraudEngine = require('./utils/fraudEngine');
 const paymentService = require('./services/paymentService');
 
@@ -336,6 +345,71 @@ async function closeExpiredRafflesBatch(limit = 200) {
 
 const app = express();
 
+// Render / proxies: necesario para construir URLs con https correctamente.
+app.set('trust proxy', 1);
+
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || null;
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
+const AVATARS_DIR = path.join(UPLOADS_DIR, 'avatars');
+
+function ensureUploadsDirs() {
+  try {
+    fs.mkdirSync(AVATARS_DIR, { recursive: true });
+  } catch (e) {
+    console.error('[uploads] mkdir failed:', e?.message || e);
+  }
+}
+
+function getPublicBaseUrl(req) {
+  if (PUBLIC_BASE_URL) return String(PUBLIC_BASE_URL).replace(/\/$/, '');
+  return `${req.protocol}://${req.get('host')}`;
+}
+
+function tryDeleteOldAvatarFile(oldAvatarUrl) {
+  try {
+    if (!oldAvatarUrl || typeof oldAvatarUrl !== 'string') return;
+    const asUrl = oldAvatarUrl.startsWith('http')
+      ? new URL(oldAvatarUrl)
+      : new URL(oldAvatarUrl, 'http://localhost');
+    const pathname = asUrl.pathname || '';
+    if (!pathname.startsWith('/uploads/avatars/')) return;
+
+    const filename = path.basename(pathname);
+    if (!filename) return;
+    const fullPath = path.join(AVATARS_DIR, filename);
+    if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+  } catch (_e) {
+    // best-effort
+  }
+}
+
+function parseDataUrlImage(dataUrl) {
+  const str = String(dataUrl || '');
+  const m = str.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+  if (!m) return null;
+  const base64 = m[2];
+  const buffer = Buffer.from(base64, 'base64');
+  return { mime: m[1], buffer };
+}
+
+async function saveAvatarBuffer(req, userId, buffer) {
+  if (!sharp) throw new Error('sharp_not_available');
+  ensureUploadsDirs();
+
+  const safeUserId = Number(userId);
+  const filename = `avatar_${safeUserId}_${Date.now()}.webp`;
+  const relPath = `/uploads/avatars/${filename}`;
+  const fullPath = path.join(AVATARS_DIR, filename);
+
+  await sharp(buffer)
+    .resize(256, 256, { fit: 'cover' })
+    .webp({ quality: 80 })
+    .toFile(fullPath);
+
+  const url = `${getPublicBaseUrl(req)}${relPath}`;
+  return { url, relPath, fullPath };
+}
+
 // Diagnóstico mínimo: permite verificar rápidamente qué build/entorno está corriendo en Render.
 // No expone secretos (solo metadatos básicos).
 app.get('/__version', (req, res) => {
@@ -369,6 +443,16 @@ console.log('🔒 Security Module Loaded: Encryption Enabled');
 app.use(helmet());
 app.use(cors());
 app.use(compression());
+
+// Archivos subidos (avatars, etc.)
+ensureUploadsDirs();
+app.use(
+  '/uploads',
+  express.static(UPLOADS_DIR, {
+    etag: true,
+    maxAge: '7d'
+  })
+);
 
 // Simple request logger (method, path, duration)
 app.use((req, res, next) => {
@@ -6422,14 +6506,22 @@ app.get('/me', authenticateToken, async (req, res) => {
       where: { id: req.user.userId },
       select: {
         id: true,
+        publicId: true,
+        securityId: true,
         email: true,
         name: true,
+        phone: true,
+        address: true,
+        cedula: true,
+        state: true,
         role: true,
         adminPlan: true,
         balance: true,
         avatar: true,
         bio: true,
         socials: true,
+        verified: true,
+        identityVerified: true,
         referralCode: true,
         createdAt: true
       }
@@ -6437,7 +6529,10 @@ app.get('/me', authenticateToken, async (req, res) => {
     if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
 
     // Decrypt sensitive data
-    if (user.name) user.name = decrypt(user.name);
+    if (user.name) user.name = safeDecrypt(user.name);
+    if (user.phone) user.phone = safeDecrypt(user.phone);
+    if (user.address) user.address = safeDecrypt(user.address);
+    if (user.cedula) user.cedula = safeDecrypt(user.cedula);
 
     res.json(user);
   } catch (error) {
@@ -6446,14 +6541,124 @@ app.get('/me', authenticateToken, async (req, res) => {
   }
 });
 
+// Sube avatar como archivo (multipart/form-data). Guarda URL en BD.
+app.post(
+  '/me/avatar',
+  authenticateToken,
+  upload.fields([
+    { name: 'avatar', maxCount: 1 },
+    { name: 'file', maxCount: 1 }
+  ]),
+  async (req, res) => {
+    try {
+      const file = req?.files?.avatar?.[0] || req?.files?.file?.[0] || null;
+      if (!file || !file.buffer) {
+        return res.status(400).json({ error: 'Archivo requerido' });
+      }
+      if (!sharp) {
+        return res.status(500).json({ error: 'Procesador de imagen no disponible' });
+      }
+      if (file.size && file.size > 5 * 1024 * 1024) {
+        return res.status(413).json({ error: 'Avatar demasiado grande (max 5MB)' });
+      }
+
+      const prev = await prisma.user.findUnique({
+        where: { id: req.user.userId },
+        select: { avatar: true }
+      });
+
+      const saved = await saveAvatarBuffer(req, req.user.userId, file.buffer);
+      await prisma.user.update({
+        where: { id: req.user.userId },
+        data: { avatar: saved.url }
+      });
+
+      // Limpieza best-effort del archivo anterior
+      if (prev?.avatar && prev.avatar !== saved.url) {
+        tryDeleteOldAvatarFile(prev.avatar);
+      }
+
+      res.json({ avatar: saved.url });
+    } catch (error) {
+      console.error('[POST /me/avatar]', error);
+      res.status(500).json({ error: 'Error al subir avatar' });
+    }
+  }
+);
+
 app.patch('/me', authenticateToken, async (req, res) => {
   try {
-    const { name, avatar, bio, socials } = req.body;
+    const { name, avatar, bio, socials, phone, address, cedula } = req.body;
+    const data = {};
+
+    if (name !== undefined) {
+      const trimmedName = String(name ?? '').trim();
+      if (trimmedName) data.name = encrypt(trimmedName);
+    }
+    // Avatar: si llega como dataURL/base64, convertir a archivo y guardar solo URL en BD.
+    let oldAvatarForCleanup = null;
+    let newAvatarForCleanup = null;
+    if (avatar !== undefined) {
+      if (!avatar) {
+        data.avatar = null;
+      } else {
+        const avatarStr = String(avatar);
+        if (avatarStr.startsWith('data:image/')) {
+          const parsed = parseDataUrlImage(avatarStr);
+          if (!parsed) {
+            return res.status(400).json({ error: 'Formato de avatar inválido' });
+          }
+          if (parsed.buffer.length > 5 * 1024 * 1024) {
+            return res.status(413).json({ error: 'Avatar demasiado grande (max 5MB)' });
+          }
+          if (!sharp) {
+            // Fallback (no ideal): si sharp no está disponible, mantener compatibilidad.
+            data.avatar = avatarStr;
+          } else {
+            const prev = await prisma.user.findUnique({
+              where: { id: req.user.userId },
+              select: { avatar: true }
+            });
+            oldAvatarForCleanup = prev?.avatar || null;
+            const saved = await saveAvatarBuffer(req, req.user.userId, parsed.buffer);
+            data.avatar = saved.url;
+            newAvatarForCleanup = saved.url;
+          }
+        } else {
+          // URL o string normal
+          if (avatarStr.length > 2048) {
+            return res.status(400).json({ error: 'Avatar demasiado largo' });
+          }
+          data.avatar = avatarStr;
+        }
+      }
+    }
+    if (bio !== undefined) data.bio = bio ? String(bio) : null;
+    if (socials !== undefined) data.socials = socials && typeof socials === 'object' ? socials : {};
+
+    if (phone !== undefined) data.phone = phone ? encrypt(String(phone)) : null;
+    if (address !== undefined) data.address = address ? encrypt(String(address)) : null;
+    if (cedula !== undefined) data.cedula = cedula ? encrypt(String(cedula)) : null;
+
     const user = await prisma.user.update({
       where: { id: req.user.userId },
-      data: { name, avatar, bio, socials }
+      data
     });
-    res.json(user);
+
+    // Limpieza best-effort del archivo anterior si lo reemplazamos.
+    if (oldAvatarForCleanup && newAvatarForCleanup && oldAvatarForCleanup !== newAvatarForCleanup) {
+      tryDeleteOldAvatarFile(oldAvatarForCleanup);
+    }
+
+    // Responder con datos desencriptados, consistente con GET /me
+    const out = {
+      ...user,
+      name: user?.name ? safeDecrypt(user.name) : user.name,
+      phone: user?.phone ? safeDecrypt(user.phone) : user.phone,
+      address: user?.address ? safeDecrypt(user.address) : user.address,
+      cedula: user?.cedula ? safeDecrypt(user.cedula) : user.cedula,
+    };
+    res.json(out);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Error al actualizar perfil' });
