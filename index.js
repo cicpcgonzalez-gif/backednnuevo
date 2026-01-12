@@ -7197,6 +7197,53 @@ app.get('/admin/transactions', authenticateToken, authorizeRole(['admin', 'super
   }
 });
 
+// Validar boleto (Admin / Superadmin)
+app.post('/admin/tickets/validate', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const { ticketId, serial } = req.body || {};
+    if (!ticketId && !serial) return res.status(400).json({ error: 'ticketId o serial requerido' });
+
+    let ticket = null;
+    if (ticketId) {
+      ticket = await prisma.ticket.findUnique({ where: { id: Number(ticketId) } });
+    } else if (serial) {
+      ticket = await prisma.ticket.findFirst({ where: { OR: [{ serialNumber: String(serial) }, { code: String(serial) }] } });
+    }
+
+    if (!ticket) return res.status(404).json({ error: 'Ticket no encontrado' });
+
+    const status = String(ticket.status || '').toLowerCase();
+    if (status === 'redeemed' || status === 'used' || status === 'closed') {
+      return res.status(400).json({ error: 'Ticket ya fue validado' });
+    }
+
+    // Marcar como redimido
+    const updated = await prisma.ticket.update({ where: { id: ticket.id }, data: { status: 'redeemed' } });
+
+    // Registrar auditoría
+    try {
+      await prisma.auditLog.create({
+        data: {
+          action: 'TICKET_VALIDATED',
+          userId: req.user.userId,
+          entity: 'Ticket',
+          entityId: String(ticket.id),
+          detail: `Ticket validado por admin ${req.user.userId}`,
+          severity: 'INFO',
+          metadata: { serial: ticket.serialNumber ?? null }
+        }
+      });
+    } catch (_e) {
+      // no bloquear la respuesta por fallo en auditoría
+    }
+
+    res.json({ ok: true, ticket: { id: updated.id, status: updated.status } });
+  } catch (error) {
+    console.error('[POST /admin/tickets/validate] error', error);
+    res.status(500).json({ error: 'Error al validar ticket' });
+  }
+});
+
 // Verificar un número de transacción (auditable)
 app.get('/admin/transactions/verify/:txCode', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
   const txCode = String(req.params.txCode || '').trim();
@@ -7413,6 +7460,55 @@ app.post('/admin/manual-payments/:id/reject', authenticateToken, authorizeRole([
     res.json({ message: 'Pago rechazado' });
   } catch (error) {
     res.status(500).json({ error: 'Error al rechazar pago' });
+  }
+});
+
+// Validar ticket (Superadmin / Admin)
+app.post('/admin/tickets/validate', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  const { serialNumber, raffleId, number } = req.body || {};
+  if (!serialNumber && !(raffleId && number)) {
+    return res.status(400).json({ error: 'serialNumber o (raffleId + number) requerido' });
+  }
+
+  try {
+    let ticket = null;
+    if (serialNumber) {
+      ticket = await prisma.ticket.findUnique({ where: { serialNumber: String(serialNumber) } });
+    } else {
+      ticket = await prisma.ticket.findFirst({ where: { raffleId: Number(raffleId), number: Number(number) } });
+    }
+
+    if (!ticket) return res.status(404).json({ error: 'Ticket no encontrado' });
+
+    const currentStatus = String(ticket.status || '').toLowerCase();
+    if (currentStatus === 'validated' || currentStatus === 'used') {
+      return res.status(400).json({ error: 'Ticket ya validado' });
+    }
+
+    const updated = await prisma.ticket.update({ where: { id: Number(ticket.id) }, data: { status: 'validated' } });
+
+    try {
+      if (typeof securityLogger !== 'undefined' && securityLogger && typeof securityLogger.log === 'function') {
+        await securityLogger.log({
+          action: 'TICKET_VALIDATED',
+          userEmail: req.user?.email,
+          userId: req.user?.userId,
+          ipAddress: String(req.ip || req.headers['x-forwarded-for'] || ''),
+          userAgent: String(req.headers['user-agent'] || ''),
+          severity: 'INFO',
+          detail: `Ticket validated serial=${updated.serialNumber || ''} number=${updated.number || ''} raffle=${updated.raffleId}`,
+          entity: 'Ticket',
+          entityId: String(updated.id)
+        });
+      }
+    } catch (_e) {
+      // No bloquear si falla el logger
+    }
+
+    return res.json({ ok: true, ticket: updated });
+  } catch (error) {
+    console.error('[/admin/tickets/validate] Error:', error);
+    return res.status(500).json({ error: 'Error al validar ticket' });
   }
 });
 
