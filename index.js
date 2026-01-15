@@ -151,6 +151,16 @@ function safeDecrypt(value) {
   }
 }
 
+function escapeHtml(str) {
+  if (str == null) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
 function normalizePaymentMethods(value) {
   if (Array.isArray(value)) {
     return value
@@ -4914,6 +4924,30 @@ app.post('/admin/winners', authenticateToken, authorizeRole(['admin', 'superadmi
       }
     } catch (_e) {
       // no bloquear
+    }
+
+    // Notificar directamente al ganador por correo y push
+    try {
+      const winnerUser = await prisma.user.findUnique({ where: { id: ticket.userId }, select: { id: true, email: true, pushToken: true, name: true } });
+      const winnerName = winnerUser?.name ? safeDecrypt(winnerUser.name) : null;
+      const digits = getTicketDigitsFromRaffle(raffle);
+      const displayNumber = formatTicketNumber(tnum, digits);
+
+      if (winnerUser?.email) {
+        const subject = `¡Has ganado en MegaRifas! Rifa: ${raffle.title}`;
+        const text = `Felicidades ${winnerName || ''}. Tu número ${displayNumber} ha resultado ganador en la rifa ${raffle.title}. Ponte en contacto con el organizador para reclamar tu premio.`;
+        const html = `<h1>¡Felicidades ${escapeHtml(winnerName || '')}!</h1><p>Tu número <b>${escapeHtml(displayNumber)}</b> ha resultado ganador en la rifa <b>${escapeHtml(raffle.title)}</b>.</p><p>Premio: <b>${escapeHtml(String(prize).trim())}</b></p><p>Por favor ponte en contacto con el organizador para coordinar la entrega.</p>`;
+        sendEmail(winnerUser.email, subject, text, html).catch(console.error);
+      }
+
+      if (winnerUser?.pushToken) {
+        const title = '¡Eres ganador!';
+        const body = `Tu número ${displayNumber} ganó en ${raffle.title}`;
+        sendPushNotification([winnerUser.pushToken], title, body, { type: 'you_won', raffleId: rid, ticketNumber: tnum }).catch(console.error);
+      }
+    } catch (notifyErr) {
+      console.error('[WINNER_NOTIFY] error:', notifyErr);
+      // no bloquear la respuesta si falla la notificación
     }
 
     try {
