@@ -5306,6 +5306,77 @@ app.post('/raffles/:id/close', authenticateToken, authorizeRole(['admin', 'super
   }
 });
 
+// Endpoint conveniente para declarar ganador desde UI de rifero: POST /raffles/:id/declare-winner
+app.post('/raffles/:id/declare-winner', authenticateToken, authorizeRole(['admin', 'superadmin']), async (req, res) => {
+  const raffleId = Number(req.params.id);
+  const winningNumberRaw = req.body?.winningNumber;
+  const proof = req.body?.proof || null;
+
+  if (!raffleId || !Number.isFinite(raffleId)) return res.status(400).json({ error: 'ID inválido' });
+  if (winningNumberRaw == null || String(winningNumberRaw).trim() === '') return res.status(400).json({ error: 'Número ganador requerido' });
+
+  const tnum = Number(winningNumberRaw);
+  try {
+    const raffle = await prisma.raffle.findUnique({ where: { id: raffleId }, select: { id: true, userId: true, title: true, prize: true, style: true, status: true } });
+    if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
+
+    const actorRole = String(req.user?.role || '').toLowerCase();
+    const actorId = req.user?.userId;
+    const actorIdNum = Number(actorId);
+    const raffleOwnerIdNum = Number(raffle.userId);
+    if (actorRole !== 'superadmin' && raffleOwnerIdNum !== actorIdNum) return res.status(403).json({ error: 'No autorizado para declarar ganador en esta rifa' });
+
+    // Buscar ticket
+    let ticket = await prisma.ticket.findFirst({ where: { raffleId, number: tnum }, include: { user: { select: { id: true, name: true, email: true, avatar: true, pushToken: true } } } });
+    if (!ticket) {
+      // fallback por serial
+      const serialCandidate = String(winningNumberRaw || '').trim();
+      if (serialCandidate) {
+        ticket = await prisma.ticket.findFirst({ where: { raffleId, serialNumber: serialCandidate }, include: { user: { select: { id: true, name: true, email: true, avatar: true, pushToken: true } } } });
+      }
+    }
+    if (!ticket) return res.status(404).json({ error: 'Ese número no existe como ticket comprado en esta rifa' });
+
+    // Evitar duplicados: si ya existe winner para este raffle+number, error
+    const exists = await prisma.winner.findFirst({ where: { raffleId, ticketNumber: ticket.number } });
+    if (exists) return res.status(409).json({ error: 'Ya existe un ganador declarado para ese número' });
+
+    const winner = await prisma.winner.create({ data: { raffleId, userId: ticket.userId, drawSlot: 'final', ticketNumber: ticket.number, prize: raffle.prize || null, photoUrl: proof || null } });
+
+    // Notificar al ganador (email + push) y a participantes (push broadcast)
+    try {
+      const winnerUser = await prisma.user.findUnique({ where: { id: ticket.userId }, select: { id: true, email: true, pushToken: true, name: true } });
+      const winnerName = winnerUser?.name ? safeDecrypt(winnerUser.name) : null;
+      const digits = getTicketDigitsFromRaffle(raffle);
+      const displayNumber = formatTicketNumber(ticket.number, digits);
+      if (winnerUser?.email) {
+        const subject = `¡Has ganado en ${raffle.title}!`;
+        const text = `Felicidades ${winnerName || ''}. Tu número ${displayNumber} ha ganado.`;
+        const html = `<h1>¡Felicidades ${escapeHtml(winnerName || '')}!</h1><p>Tu número <b>${escapeHtml(displayNumber)}</b> ganó en la rifa <b>${escapeHtml(raffle.title)}</b>.</p>`;
+        sendEmail(winnerUser.email, subject, text, html).catch(console.error);
+      }
+      if (winnerUser?.pushToken) {
+        sendPushNotification([winnerUser.pushToken], '¡Eres ganador!', `Tu número ${displayNumber} ganó en ${raffle.title}`, { type: 'you_won', raffleId }).catch(console.error);
+      }
+      // broadcast a participantes
+      try {
+        const participants = await prisma.ticket.findMany({ where: { raffleId }, distinct: ['userId'], select: { user: { select: { pushToken: true } } } });
+        const tokens = (participants || []).map(p => p?.user?.pushToken).filter(Boolean);
+        if (tokens.length) sendPushNotification(tokens, `Resultados: ${raffle.title}`, `Número ganador: ${displayNumber}`, { type: 'raffle_result', raffleId }).catch(console.error);
+      } catch (e) { /* no bloquear */ }
+    } catch (e) { console.error('[DECLARE_WIN_NOTIFY]', e); }
+
+    try { await securityLogger.log({ action: 'WINNER_DECLARED', userEmail: String(req.user?.email || ''), userId: actorIdNum || null, ipAddress: String(req.ip || ''), userAgent: String(req.headers['user-agent'] || ''), severity: 'INFO', detail: `Ganador declarado rifa ${raffleId} -> ticket ${ticket.number}`, entity: 'Raffle', entityId: String(raffleId), metadata: { winnerId: winner.id } }); } catch (_e) {}
+
+    return res.json({ message: 'Ganador declarado', winner });
+  } catch (error) {
+    console.error('[DECLARE_WINNER]', error);
+    const debugEnabled = String(process.env.DEBUG_DECLARE_WINNER || '').trim() === '1';
+    const message = debugEnabled ? String(error?.message || error) : 'Error al declarar ganador';
+    return res.status(500).json({ error: message });
+  }
+});
+
 // Job protegido: cerrar rifas vencidas por endDate (útil para pruebas / cumplimiento)
 app.post('/admin/jobs/close-expired-raffles', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
   try {
