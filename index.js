@@ -353,6 +353,54 @@ async function closeExpiredRafflesBatch(limit = 200) {
   return { scanned: (active || []).length, closed };
 }
 
+// Pre-generate ticket placeholders for a raffle (numbers 1..totalTickets)
+// Uses `createMany` in chunks and `skipDuplicates` to be idempotent.
+async function generateTicketsForRaffle(raffleId, totalTickets) {
+  try {
+    const max = Number(totalTickets) || 0;
+    if (!Number.isFinite(max) || max <= 0) return { created: 0 };
+
+    // Count existing ticket numbers for this raffle
+    const existing = await prisma.ticket.findMany({ where: { raffleId }, select: { number: true } });
+    const have = new Set((existing || []).map((r) => Number(r.number)).filter((n) => Number.isFinite(n) && n > 0));
+
+    const toCreate = [];
+    for (let i = 1; i <= max; i++) {
+      if (!have.has(i)) {
+        toCreate.push({ raffleId, number: i, status: 'available' });
+      }
+    }
+    if (!toCreate.length) return { created: 0 };
+
+    const chunkSize = 500;
+    let created = 0;
+    for (let i = 0; i < toCreate.length; i += chunkSize) {
+      const chunk = toCreate.slice(i, i + chunkSize);
+      try {
+        // skipDuplicates to avoid race issues; supported by Prisma for many DBs
+        const info = await prisma.ticket.createMany({ data: chunk, skipDuplicates: true });
+        created += Number(info.count || 0);
+      } catch (e) {
+        // fallback: try inserting one-by-one to avoid blocking
+        for (const row of chunk) {
+          try {
+            await prisma.ticket.create({ data: row });
+            created++;
+          } catch (_e) {
+            // ignore duplicates or errors per-row
+          }
+        }
+      }
+    }
+
+    console.log(`[PREGEN_TICKETS] raffle=${raffleId} created=${created} missing=${toCreate.length}`);
+    return { created };
+  } catch (error) {
+    console.error('[PREGEN_TICKETS] error:', error);
+    return { error: String(error?.message || error) };
+  }
+}
+
 const app = express();
 
 // Render / proxies: necesario para construir URLs con https correctamente.
@@ -4307,6 +4355,17 @@ app.post('/admin/raffles/:id/activate', authenticateToken, authorizeRole(['admin
     if (actorRole === 'superadmin') {
       const updated = await prisma.raffle.update({ where: { id: raffleId }, data: { status: 'active', activatedAt: now } });
 
+      // Pre-generate tickets for this raffle so every number has a DB record.
+      try {
+        const pregenerate = String(process.env.PREGENERATE_TICKETS_ON_ACTIVATE || '1') === '1';
+        if (pregenerate && Number(updated.totalTickets) > 0) {
+          const out = await generateTicketsForRaffle(updated.id, updated.totalTickets);
+          console.log('[RAFFLE_ACTIVATE] pregenerate result:', out);
+        }
+      } catch (e) {
+        console.error('[RAFFLE_ACTIVATE] pregenerate failed:', e);
+      }
+
       try {
         await securityLogger.log({
           action: 'RAFFLE_ACTIVATED',
@@ -4358,6 +4417,17 @@ app.post('/admin/raffles/:id/activate', authenticateToken, authorizeRole(['admin
     });
 
     try {
+      // After activation, pre-generate tickets if enabled
+      try {
+        const pregenerate = String(process.env.PREGENERATE_TICKETS_ON_ACTIVATE || '1') === '1';
+        if (pregenerate && Number(updated.totalTickets) > 0) {
+          const out = await generateTicketsForRaffle(updated.id, updated.totalTickets);
+          console.log('[RAFFLE_ACTIVATE] pregenerate result:', out);
+        }
+      } catch (e) {
+        console.error('[RAFFLE_ACTIVATE] pregenerate failed:', e);
+      }
+
       await securityLogger.log({
         action: 'RAFFLE_ACTIVATED',
         userEmail: String(req.user?.email || ''),
@@ -5311,6 +5381,14 @@ app.post('/raffles/:id/declare-winner', authenticateToken, authorizeRole(['admin
   const raffleId = Number(req.params.id);
   const winningNumberRaw = req.body?.winningNumber;
   const proof = req.body?.proof || null;
+
+  // Diagnostic log when debugging is enabled
+  if (String(process.env.DEBUG_DECLARE_WINNER || '').trim() === '1') {
+    try {
+      console.log('[DECLARE_WINNER][DEBUG] actor=', { id: req.user?.userId, email: req.user?.email, role: req.user?.role });
+      console.log('[DECLARE_WINNER][DEBUG] payload=', { raffleId: req.params.id, winningNumberRaw, proof });
+    } catch (e) { }
+  }
 
   if (!raffleId || !Number.isFinite(raffleId)) return res.status(400).json({ error: 'ID inválido' });
   if (winningNumberRaw == null || String(winningNumberRaw).trim() === '') return res.status(400).json({ error: 'Número ganador requerido' });
