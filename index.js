@@ -3280,6 +3280,57 @@ app.get('/me/raffles', authenticateToken, async (req, res) => {
   }
 });
 
+// Endpoint para que el usuario consulte si tiene wins pendientes (para mostrar confeti UNA sola vez)
+app.get('/me/pending-wins', authenticateToken, async (req, res) => {
+  try {
+    const actorUserId = req.user.userId;
+    if (!actorUserId) return res.status(401).json({ error: 'Usuario inválido' });
+
+    const win = await prisma.winner.findFirst({
+      where: { userId: actorUserId, status: 'pending' },
+      orderBy: { createdAt: 'desc' },
+      include: { raffle: { select: { id: true, title: true, userId: true } } }
+    });
+
+    if (!win) return res.json({ win: null });
+
+    const payload = {
+      id: win.id,
+      raffleId: win.raffleId,
+      raffleTitle: win.raffle?.title || null,
+      prize: win.prize,
+      ticketNumber: win.ticketNumber,
+      drawSlot: win.drawSlot,
+      createdAt: win.createdAt
+    };
+
+    return res.json({ win: payload });
+  } catch (error) {
+    console.error('[PENDING_WINS]', error);
+    return res.status(500).json({ error: 'Error al obtener wins pendientes' });
+  }
+});
+
+// Endpoint para que el usuario reconozca (ack) un win mostrado
+app.post('/me/ack-win/:id', authenticateToken, async (req, res) => {
+  try {
+    const actorUserId = req.user.userId;
+    const winId = Number(req.params.id);
+    if (!actorUserId) return res.status(401).json({ error: 'Usuario inválido' });
+    if (!winId || !Number.isFinite(winId)) return res.status(400).json({ error: 'Win id inválido' });
+
+    const win = await prisma.winner.findUnique({ where: { id: winId } });
+    if (!win) return res.status(404).json({ error: 'Win no encontrado' });
+    if (win.userId !== actorUserId) return res.status(403).json({ error: 'No autorizado' });
+
+    await prisma.winner.update({ where: { id: winId }, data: { status: 'acknowledged' } });
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error('[ACK_WIN]', error);
+    return res.status(500).json({ error: 'Error al ackear win' });
+  }
+});
+
 // CRUD para usuarios
 app.get('/users/:id', authenticateToken, async (req, res) => {
   try {
