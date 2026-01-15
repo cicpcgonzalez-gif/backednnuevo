@@ -5674,21 +5674,23 @@ app.post('/admin/winners/resolve-missing', authenticateToken, authorizeRole(['ad
 
     // 2) Posponer la resolución (por defecto 3 días)
     if (resolution === 'postpone') {
-      const postponeDays = Number(params?.postponeDays) || Number(process.env.MISSING_NUMBER_POSTPONE_DAYS) || 3;
+      // Usar params.postponeDays si viene, si no usar la política de la rifa, si no usar env/default
+      const rafflePolicy = raffle.style && typeof raffle.style === 'object' ? raffle.style.missingNumberPolicy : null;
+      const postponeDays = Number(params?.postponeDays ?? rafflePolicy?.postponeDays ?? Number(process.env.MISSING_NUMBER_POSTPONE_DAYS) ?? 3);
       const until = new Date(Date.now() + Math.max(0, postponeDays) * 24 * 60 * 60 * 1000).toISOString();
       const nextStyle = raffle.style && typeof raffle.style === 'object' ? { ...raffle.style } : {};
-      nextStyle.pendingResolution = { status: 'postponed', until, winningNumber: winningNumberRaw, reason };
+      nextStyle.pendingResolution = { status: 'postponed', until, winningNumber: winningNumberRaw, reason, postponeDays };
       await prisma.raffle.update({ where: { id: raffleId }, data: { style: nextStyle } });
 
-      try { await securityLogger.log({ action: 'WINNER_RESOLVED_POSTPONE', userEmail: String(req.user?.email || ''), userId: Number(req.user?.userId) || null, ipAddress: String(req.ip || ''), userAgent: String(req.headers['user-agent'] || ''), severity: 'INFO', detail: `Rifa ${raffleId} pospuesta hasta ${until} por número no vendido ${winningNumberRaw}`, entity: 'Raffle', entityId: String(raffleId), metadata: { until, reason } }); } catch (_e) {}
+      try { await securityLogger.log({ action: 'WINNER_RESOLVED_POSTPONE', userEmail: String(req.user?.email || ''), userId: Number(req.user?.userId) || null, ipAddress: String(req.ip || ''), userAgent: String(req.headers['user-agent'] || ''), severity: 'INFO', detail: `Rifa ${raffleId} pospuesta hasta ${until} por número no vendido ${winningNumberRaw}`, entity: 'Raffle', entityId: String(raffleId), metadata: { until, reason, postponeDays } }); } catch (_e) {}
 
       // Notificar al propietario de la rifa
       try {
         const owner = await prisma.user.findUnique({ where: { id: raffle.userId }, select: { id: true, email: true, pushToken: true, name: true } });
-        if (owner?.email) sendEmail(owner.email, `Rifa ${raffle.title} pospuesta`, `La resolución del número ${winningNumberRaw} ha sido pospuesta hasta ${until}. Razón: ${reason || 'No especificada'}.`).catch(console.error);
+        if (owner?.email) sendEmail(owner.email, `Rifa ${raffle.title} pospuesta`, `La resolución del número ${winningNumberRaw} ha sido pospuesta hasta ${until}. Razón: ${reason || 'No especificada'}. Días: ${postponeDays}`).catch(console.error);
       } catch (e) { console.error('[POSTPONE_NOTIFY]', e); }
 
-      return res.json({ message: 'Rifa pospuesta para re-evaluación', until });
+      return res.json({ message: 'Rifa pospuesta para re-evaluación', until, postponeDays });
     }
 
     // 3) Cerrar sin ganador
