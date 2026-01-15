@@ -2022,6 +2022,150 @@ app.post('/register', async (req, res) => {
   }
 });
 
+// Autorregistro de organizador (queda en estado pendiente hasta aprobación)
+app.post('/organizers/register', async (req, res) => {
+  const { email, name, password, state, phone, cedula } = req.body || {};
+  const safeEmail = normalizeEmail(email);
+  const fullName = String(name || '').trim();
+  if (!safeEmail || !fullName || !password || !state) {
+    return res.status(400).json({ error: 'Faltan datos requeridos' });
+  }
+
+  try {
+    const existing = await prisma.user.findUnique({ where: { email: safeEmail } });
+    if (existing) {
+      if (existing.role === 'pending_admin') return res.status(409).json({ error: 'Solicitud previa pendiente' });
+      return res.status(409).json({ error: 'Ya existe una cuenta con ese email' });
+    }
+
+    const hashed = await bcrypt.hash(password, 10);
+    const securityId = await generateUniqueSecurityId();
+
+    const created = await prisma.user.create({
+      data: {
+        email: safeEmail,
+        name: encrypt(fullName),
+        password: hashed,
+        state: String(state || 'DESCONOCIDO'),
+        phone: phone ? encrypt(String(phone)) : null,
+        cedula: cedula ? encrypt(String(cedula)) : null,
+        publicId: generateShortId('USR'),
+        securityId,
+        role: 'pending_admin',
+        verified: false,
+        active: true
+      }
+    });
+
+    // Notificar al superadmin vía correo + audit log
+    try {
+      const adminEmail = SUPERADMIN_EMAIL;
+      if (adminEmail) {
+        await sendEmail(
+          adminEmail,
+          'Nueva solicitud de organizador',
+          `Nueva solicitud de cuenta organizador: ${safeEmail}`,
+          `<p>Nueva solicitud de organizador: <b>${escapeHtml(safeEmail)}</b></p><p>Nombre: ${escapeHtml(fullName)}</p>`
+        );
+      }
+    } catch (_e) {}
+
+    try {
+      await securityLogger.log({
+        action: 'ORGANIZER_REQUEST_CREATED',
+        userEmail: safeEmail,
+        userId: created.id,
+        detail: 'Organizer self-registration request created',
+        severity: 'INFO'
+      });
+    } catch (_e) {}
+
+    return res.status(201).json({ message: 'Solicitud enviada. Esperando aprobación de administrador.' });
+  } catch (error) {
+    console.error('[organizers/register] error:', error);
+    return res.status(500).json({ error: 'Error al procesar la solicitud' });
+  }
+});
+
+// Superadmin: listar solicitudes pendientes de organizadores
+app.get('/superadmin/pending-organizers', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
+  try {
+    const pending = await prisma.user.findMany({
+      where: { role: 'pending_admin' },
+      select: { id: true, email: true, name: true, createdAt: true, state: true }
+    });
+    const mapped = pending.map(u => ({ id: u.id, email: u.email, name: u.name ? safeDecrypt(u.name) : null, createdAt: u.createdAt, state: u.state }));
+    res.json(mapped);
+  } catch (error) {
+    console.error('[pending-organizers] error:', error);
+    res.status(500).json({ error: 'Error al obtener solicitudes' });
+  }
+});
+
+// Superadmin: aprobar organizador
+app.post('/superadmin/approve-organizer/:id', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'ID inválido' });
+    const user = await prisma.user.findUnique({ where: { id } });
+    if (!user || user.role !== 'pending_admin') return res.status(404).json({ error: 'Solicitud no encontrada' });
+
+    const updated = await prisma.user.update({ where: { id }, data: { role: 'admin', verified: true, active: true } });
+
+    try {
+      if (updated.email) {
+        await sendEmail(
+          updated.email,
+          'Solicitud Aprobada - MegaRifas',
+          'Tu solicitud de organizador ha sido aprobada. Ya puedes iniciar sesión como organizador.',
+          `<p>Hola ${safeDecrypt(updated.name)},</p><p>Tu solicitud de organizador ha sido aprobada. Ya puedes iniciar sesión y crear rifas.</p>`
+        );
+      }
+    } catch (_e) {}
+
+    try {
+      await securityLogger.log({ action: 'ORGANIZER_APPROVED', userEmail: updated.email, userId: updated.id, detail: 'Organizer approved by superadmin', severity: 'INFO' });
+    } catch (_e) {}
+
+    res.json({ message: 'Organizador aprobado', user: { id: updated.id, email: updated.email } });
+  } catch (error) {
+    console.error('[approve-organizer] error:', error);
+    res.status(500).json({ error: 'Error al aprobar organizador' });
+  }
+});
+
+// Superadmin: rechazar solicitud de organizador
+app.post('/superadmin/reject-organizer/:id', authenticateToken, authorizeRole(['superadmin']), async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const reason = String(req.body?.reason || 'No especificado');
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'ID inválido' });
+    const user = await prisma.user.findUnique({ where: { id } });
+    if (!user || user.role !== 'pending_admin') return res.status(404).json({ error: 'Solicitud no encontrada' });
+
+    // Dejar registro pero desactivar la cuenta por seguridad
+    const updated = await prisma.user.update({ where: { id }, data: { role: 'user', active: false } });
+
+    try {
+      if (updated.email) {
+        await sendEmail(
+          updated.email,
+          'Solicitud Rechazada - MegaRifas',
+          `Tu solicitud ha sido rechazada. Motivo: ${reason}`,
+          `<p>Lo sentimos. Tu solicitud de organizador ha sido rechazada.</p><p>Motivo: ${escapeHtml(reason)}</p>`
+        );
+      }
+    } catch (_e) {}
+
+    try { await securityLogger.log({ action: 'ORGANIZER_REJECTED', userEmail: updated.email, userId: updated.id, detail: `Organizer rejected: ${reason}`, severity: 'WARN' }); } catch (_e) {}
+
+    res.json({ message: 'Solicitud rechazada' });
+  } catch (error) {
+    console.error('[reject-organizer] error:', error);
+    res.status(500).json({ error: 'Error al rechazar solicitud' });
+  }
+});
+
 // Verificar email
 app.post('/verify-email', async (req, res) => {
   const { email, code } = req.body;
