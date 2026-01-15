@@ -353,6 +353,60 @@ async function closeExpiredRafflesBatch(limit = 200) {
   return { scanned: (active || []).length, closed };
 }
 
+// Re-evaluar rifas pospuestas por número no vendido
+async function reEvaluatePostponedRafflesBatch(limit = 200) {
+  const safeLimit = Number.isFinite(Number(limit)) ? Math.max(1, Math.min(2000, Number(limit))) : 200;
+  const active = await prisma.raffle.findMany({ where: { status: 'active' }, select: { id: true, title: true, style: true, totalTickets: true, userId: true, prize: true } , take: safeLimit });
+  let resolved = 0;
+  let skipped = 0;
+  const processed = [];
+
+  for (const r of active || []) {
+    try {
+      const pending = r.style && typeof r.style === 'object' ? r.style.pendingResolution : null;
+      if (!pending || pending.status !== 'postponed') { skipped++; continue; }
+      const until = pending.until ? new Date(pending.until) : null;
+      if (!until || until.getTime() > Date.now()) { skipped++; continue; }
+
+      // Time to resolve: if there are sold tickets, pick random; else close no winner
+      const soldCount = await prisma.ticket.count({ where: { raffleId: r.id, status: 'approved' } });
+      if (soldCount > 0) {
+        const sold = await prisma.ticket.findMany({ where: { raffleId: r.id, status: 'approved' }, select: { id: true, number: true, userId: true } });
+        const pick = sold[Math.floor(Math.random() * sold.length)];
+        const winner = await prisma.winner.create({ data: { raffleId: r.id, userId: pick.userId, drawSlot: 'final', ticketNumber: pick.number, prize: r.prize || null, photoUrl: null } });
+        // notify
+        try {
+          const winnerUser = await prisma.user.findUnique({ where: { id: pick.userId }, select: { id: true, email: true, pushToken: true, name: true } });
+          const winnerName = winnerUser?.name ? safeDecrypt(winnerUser.name) : null;
+          const digits = getTicketDigitsFromRaffle(r);
+          const displayNumber = formatTicketNumber(pick.number, digits);
+          if (winnerUser?.email) sendEmail(winnerUser.email, `¡Has ganado en ${r.title}!`, `Felicidades ${winnerName || ''}. Tu número ${displayNumber} ha ganado.`, `<h1>¡Felicidades ${escapeHtml(winnerName || '')}!</h1><p>Tu número <b>${escapeHtml(displayNumber)}</b> ganó en la rifa <b>${escapeHtml(r.title)}</b>.</p>`).catch(console.error);
+          if (winnerUser?.pushToken) sendPushNotification([winnerUser.pushToken], '¡Eres ganador!', `Tu número ${displayNumber} ganó en ${r.title}`, { type: 'you_won', raffleId: r.id }).catch(console.error);
+        } catch (e) { console.error('[RE_EVAL_NOTIFY]', e); }
+
+        try { await securityLogger.log({ action: 'WINNER_RESOLVED_REEVALUATE_RANDOM', userEmail: null, userId: null, ipAddress: null, userAgent: null, severity: 'INFO', detail: `Re-evaluación: seleccionado random para rifa ${r.id} -> ticket ${pick.number}`, entity: 'Raffle', entityId: String(r.id), metadata: { method: 're_evaluate_random', winnerId: winner.id } }); } catch (_e) {}
+        // clear pendingResolution
+        const nextStyle = r.style && typeof r.style === 'object' ? { ...r.style } : {};
+        delete nextStyle.pendingResolution;
+        await prisma.raffle.update({ where: { id: r.id }, data: { style: nextStyle } });
+        resolved++; processed.push({ raffleId: r.id, action: 'random_sold', winnerId: winner.id });
+      } else {
+        // close without winner
+        const out = await closeRaffleInternal(r.id, 're_evaluate_close_no_winner');
+        try { await securityLogger.log({ action: 'WINNER_RESOLVED_REEVALUATE_CLOSE', userEmail: null, userId: null, ipAddress: null, userAgent: null, severity: 'INFO', detail: `Re-evaluación: cierre sin ganador rifa ${r.id}`, entity: 'Raffle', entityId: String(r.id), metadata: { result: out } }); } catch (_e) {}
+        const nextStyle = r.style && typeof r.style === 'object' ? { ...r.style } : {};
+        delete nextStyle.pendingResolution;
+        await prisma.raffle.update({ where: { id: r.id }, data: { style: nextStyle } });
+        resolved++; processed.push({ raffleId: r.id, action: 'close_no_winner', result: out });
+      }
+    } catch (e) {
+      console.error('[RE_EVAL_ITEM_ERROR]', e);
+    }
+  }
+
+  return { scanned: (active || []).length, resolved, skipped, processed };
+}
+
 // Pre-generate ticket placeholders for a raffle (numbers 1..totalTickets)
 // Uses `createMany` in chunks and `skipDuplicates` to be idempotent.
 async function generateTicketsForRaffle(raffleId, totalTickets) {
@@ -5413,7 +5467,63 @@ app.post('/raffles/:id/declare-winner', authenticateToken, authorizeRole(['admin
         ticket = await prisma.ticket.findFirst({ where: { raffleId, serialNumber: serialCandidate }, include: { user: { select: { id: true, name: true, email: true, avatar: true, pushToken: true } } } });
       }
     }
-    if (!ticket) return res.status(404).json({ error: 'Ese número no existe como ticket comprado en esta rifa' });
+    if (!ticket) {
+      // Número no vendido: verificar política (en raffle.style.missingNumberPolicy)
+      try {
+        const soldCount = await prisma.ticket.count({ where: { raffleId, status: 'approved' } });
+        const totalTickets = Number(raffle.totalTickets ?? raffle.ticketsTotal ?? 0) || 0;
+
+        const defaultPolicy = { mode: 'owner_decides', minPercent: 0, postponeDays: Number(process.env.MISSING_NUMBER_POSTPONE_DAYS) || 3 };
+        const rafflePolicy = raffle.style && typeof raffle.style === 'object' && raffle.style.missingNumberPolicy && typeof raffle.style.missingNumberPolicy === 'object'
+          ? raffle.style.missingNumberPolicy
+          : defaultPolicy;
+
+        // Calcular elegibilidad de auto-resolución si el organizador configuró modo auto_random_if_percent_sold
+        let autoEligible = false;
+        if (rafflePolicy && String(rafflePolicy.mode || '').trim() === 'auto_random_if_percent_sold' && totalTickets > 0) {
+          const min = Number(rafflePolicy.minPercent) || 0;
+          const pct = (Number(soldCount) * 100) / Number(totalTickets);
+          if (pct >= Number(min)) autoEligible = true;
+        }
+
+        // Si la política exige auto-resolver y es elegible, seleccionar un ticket vendido al azar
+        if (autoEligible) {
+          const sold = await prisma.ticket.findMany({ where: { raffleId, status: 'approved' }, select: { id: true, number: true, userId: true } });
+          if (sold && sold.length) {
+            const pick = sold[Math.floor(Math.random() * sold.length)];
+            const winner = await prisma.winner.create({ data: { raffleId, userId: pick.userId, drawSlot: 'final', ticketNumber: pick.number, prize: raffle.prize || null, photoUrl: proof || null } });
+            // Notificar y auditar como en la rama random_sold
+            try {
+              const winnerUser = await prisma.user.findUnique({ where: { id: pick.userId }, select: { id: true, email: true, pushToken: true, name: true } });
+              const winnerName = winnerUser?.name ? safeDecrypt(winnerUser.name) : null;
+              const digits = getTicketDigitsFromRaffle(raffle);
+              const displayNumber = formatTicketNumber(pick.number, digits);
+              if (winnerUser?.email) sendEmail(winnerUser.email, `¡Has ganado en ${raffle.title}!`, `Felicidades ${winnerName || ''}. Tu número ${displayNumber} ha ganado.`, `<h1>¡Felicidades ${escapeHtml(winnerName || '')}!</h1><p>Tu número <b>${escapeHtml(displayNumber)}</b> ganó en la rifa <b>${escapeHtml(raffle.title)}</b>.</p>`).catch(console.error);
+              if (winnerUser?.pushToken) sendPushNotification([winnerUser.pushToken], '¡Eres ganador!', `Tu número ${displayNumber} ganó en ${raffle.title}`, { type: 'you_won', raffleId }).catch(console.error);
+            } catch (e) { console.error('[DECLARE_WIN_AUTO_NOTIFY]', e); }
+
+            try { await securityLogger.log({ action: 'WINNER_RESOLVED_AUTO', userEmail: String(req.user?.email || ''), userId: Number(req.user?.userId) || null, ipAddress: String(req.ip || ''), userAgent: String(req.headers['user-agent'] || ''), severity: 'INFO', detail: `Auto-resolve policy selected random for rifa ${raffleId} -> ticket ${pick.number}`, entity: 'Raffle', entityId: String(raffleId), metadata: { method: 'auto_random_if_percent_sold', winnerId: winner.id } }); } catch (_e) {}
+
+            return res.json({ message: 'Ganador seleccionado automáticamente por política', winner, policy: rafflePolicy });
+          }
+        }
+
+        return res.status(409).json({
+          error: 'NUMBER_NOT_SOLD',
+          message: 'Ese número no fue vendido en esta rifa',
+          raffleId,
+          winningNumber: winningNumberRaw,
+          soldCount,
+          totalTickets,
+          options: ['random_sold', 'postpone', 'close_no_winner', 'force_manual'],
+          policy: rafflePolicy,
+          autoEligible
+        });
+      } catch (e) {
+        console.error('[DECLARE_WINNER][NO_TICKET_STATS]', e);
+        return res.status(409).json({ error: 'NUMBER_NOT_SOLD', message: 'Ese número no fue vendido en esta rifa' });
+      }
+    }
 
     // Evitar duplicados: si ya existe winner para este raffle+number, error
     const exists = await prisma.winner.findFirst({ where: { raffleId, ticketNumber: ticket.number } });
@@ -5452,6 +5562,159 @@ app.post('/raffles/:id/declare-winner', authenticateToken, authorizeRole(['admin
     const debugEnabled = String(process.env.DEBUG_DECLARE_WINNER || '').trim() === '1';
     const message = debugEnabled ? String(error?.message || error) : 'Error al declarar ganador';
     return res.status(500).json({ error: message });
+  }
+});
+
+// Admin: listar resoluciones pendientes (rifas pospuestas por número no vendido)
+app.get('/admin/winners/pending-resolutions', authenticateToken, authorizeRole(['admin','superadmin']), async (req, res) => {
+  try {
+    const active = await prisma.raffle.findMany({ where: { status: 'active' }, select: { id: true, title: true, style: true, totalTickets: true } });
+    const pending = (active || []).map(r => {
+      const pendingRes = r.style && typeof r.style === 'object' ? r.style.pendingResolution : null;
+      if (pendingRes && pendingRes.status === 'postponed') {
+        return { raffleId: r.id, title: r.title, pendingResolution: pendingRes, totalTickets: r.totalTickets };
+      }
+      return null;
+    }).filter(Boolean);
+    return res.json({ pending });
+  } catch (e) {
+    console.error('[PENDING_RESOLUTIONS]', e);
+    return res.status(500).json({ error: 'Error al listar resoluciones pendientes' });
+  }
+});
+
+// Admin: obtener la política de número no vendido para una rifa
+app.get('/admin/raffles/:id/missing-policy', authenticateToken, authorizeRole(['admin','superadmin']), async (req, res) => {
+  const raffleId = Number(req.params.id);
+  if (!raffleId || !Number.isFinite(raffleId)) return res.status(400).json({ error: 'ID inválido' });
+  try {
+    const raffle = await prisma.raffle.findUnique({ where: { id: raffleId }, select: { id: true, userId: true, title: true, style: true, totalTickets: true } });
+    if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
+
+    const defaultPolicy = { mode: 'owner_decides', minPercent: 0, postponeDays: Number(process.env.MISSING_NUMBER_POSTPONE_DAYS) || 3 };
+    const policy = raffle.style && typeof raffle.style === 'object' && raffle.style.missingNumberPolicy && typeof raffle.style.missingNumberPolicy === 'object'
+      ? raffle.style.missingNumberPolicy
+      : defaultPolicy;
+
+    return res.json({ raffleId: raffle.id, policy });
+  } catch (e) {
+    console.error('[GET_MISSING_POLICY]', e);
+    return res.status(500).json({ error: 'Error al obtener la política' });
+  }
+});
+
+// Admin: actualizar la política de número no vendido para una rifa (owner o superadmin)
+app.post('/admin/raffles/:id/missing-policy', authenticateToken, authorizeRole(['admin','superadmin']), async (req, res) => {
+  const raffleId = Number(req.params.id);
+  const mode = String(req.body?.mode || '').trim();
+  const minPercent = Number(req.body?.minPercent || 0);
+  const postponeDays = Number(req.body?.postponeDays || Number(process.env.MISSING_NUMBER_POSTPONE_DAYS) || 3);
+  if (!raffleId || !Number.isFinite(raffleId)) return res.status(400).json({ error: 'ID inválido' });
+  if (!['owner_decides','auto_random_if_percent_sold','require_manual'].includes(mode)) return res.status(400).json({ error: 'Modo inválido' });
+  try {
+    const raffle = await prisma.raffle.findUnique({ where: { id: raffleId }, select: { id: true, userId: true, style: true } });
+    if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
+
+    // Autorizar: propietario o superadmin
+    const actorRole = String(req.user?.role || '').toLowerCase();
+    const actorIdNum = Number(req.user?.userId);
+    if (actorRole !== 'superadmin' && Number(raffle.userId) !== actorIdNum) return res.status(403).json({ error: 'No autorizado para cambiar la política' });
+
+    const nextStyle = raffle.style && typeof raffle.style === 'object' ? { ...raffle.style } : {};
+    nextStyle.missingNumberPolicy = { mode, minPercent: Number(minPercent), postponeDays: Number(postponeDays) };
+    await prisma.raffle.update({ where: { id: raffleId }, data: { style: nextStyle } });
+
+    try { await securityLogger.log({ action: 'MISSING_POLICY_UPDATED', userEmail: String(req.user?.email || ''), userId: Number(req.user?.userId) || null, ipAddress: String(req.ip || ''), userAgent: String(req.headers['user-agent'] || ''), severity: 'INFO', detail: `Política missingNumberPolicy actualizada rifa ${raffleId}`, entity: 'Raffle', entityId: String(raffleId), metadata: { mode, minPercent, postponeDays } }); } catch (_e) {}
+
+    return res.json({ message: 'Política actualizada', policy: nextStyle.missingNumberPolicy });
+  } catch (e) {
+    console.error('[POST_MISSING_POLICY]', e);
+    return res.status(500).json({ error: 'Error al actualizar la política' });
+  }
+});
+
+// Admin: resolver un caso de número no vendido (POST /admin/winners/resolve-missing)
+app.post('/admin/winners/resolve-missing', authenticateToken, authorizeRole(['admin','superadmin']), async (req, res) => {
+  const raffleId = Number(req.body?.raffleId);
+  const winningNumberRaw = req.body?.winningNumber;
+  const resolution = String(req.body?.resolution || '').trim();
+  const reason = String(req.body?.reason || '').trim() || null;
+  const params = req.body?.params || {};
+
+  if (!raffleId || !Number.isFinite(raffleId)) return res.status(400).json({ error: 'ID inválido' });
+
+  try {
+    const raffle = await prisma.raffle.findUnique({ where: { id: raffleId } });
+    if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
+
+    const tnum = Number(winningNumberRaw);
+    const soldCount = await prisma.ticket.count({ where: { raffleId, status: 'approved' } });
+
+    // 1) Selección aleatoria entre vendidos
+    if (resolution === 'random_sold') {
+      if (soldCount === 0) return res.status(400).json({ error: 'No hay tickets vendidos para seleccionar al azar' });
+      const sold = await prisma.ticket.findMany({ where: { raffleId, status: 'approved' }, select: { id: true, number: true, userId: true } });
+      const pick = sold[Math.floor(Math.random() * sold.length)];
+      const winner = await prisma.winner.create({ data: { raffleId, userId: pick.userId, drawSlot: 'final', ticketNumber: pick.number, prize: raffle.prize || null, photoUrl: null } });
+
+      // Notificar ganador
+      try {
+        const winnerUser = await prisma.user.findUnique({ where: { id: pick.userId }, select: { id: true, email: true, pushToken: true, name: true } });
+        const winnerName = winnerUser?.name ? safeDecrypt(winnerUser.name) : null;
+        const digits = getTicketDigitsFromRaffle(raffle);
+        const displayNumber = formatTicketNumber(pick.number, digits);
+        if (winnerUser?.email) sendEmail(winnerUser.email, `¡Has ganado en ${raffle.title}!`, `Felicidades ${winnerName || ''}. Tu número ${displayNumber} ha ganado.`, `<h1>¡Felicidades ${escapeHtml(winnerName || '')}!</h1><p>Tu número <b>${escapeHtml(displayNumber)}</b> ganó en la rifa <b>${escapeHtml(raffle.title)}</b>.</p>`).catch(console.error);
+        if (winnerUser?.pushToken) sendPushNotification([winnerUser.pushToken], '¡Eres ganador!', `Tu número ${displayNumber} ganó en ${raffle.title}`, { type: 'you_won', raffleId }).catch(console.error);
+      } catch (e) { console.error('[RESOLVE_MISSING_NOTIFY]', e); }
+
+      try { await securityLogger.log({ action: 'WINNER_RESOLVED_RANDOM', userEmail: String(req.user?.email || ''), userId: Number(req.user?.userId) || null, ipAddress: String(req.ip || ''), userAgent: String(req.headers['user-agent'] || ''), severity: 'INFO', detail: `Resolución random_sold rifa ${raffleId} -> ticket ${pick.number}`, entity: 'Raffle', entityId: String(raffleId), metadata: { method: 'random_sold', winnerId: winner.id } }); } catch (_e) {}
+
+      return res.json({ message: 'Ganador seleccionado aleatoriamente', winner });
+    }
+
+    // 2) Posponer la resolución (por defecto 3 días)
+    if (resolution === 'postpone') {
+      const postponeDays = Number(params?.postponeDays) || Number(process.env.MISSING_NUMBER_POSTPONE_DAYS) || 3;
+      const until = new Date(Date.now() + Math.max(0, postponeDays) * 24 * 60 * 60 * 1000).toISOString();
+      const nextStyle = raffle.style && typeof raffle.style === 'object' ? { ...raffle.style } : {};
+      nextStyle.pendingResolution = { status: 'postponed', until, winningNumber: winningNumberRaw, reason };
+      await prisma.raffle.update({ where: { id: raffleId }, data: { style: nextStyle } });
+
+      try { await securityLogger.log({ action: 'WINNER_RESOLVED_POSTPONE', userEmail: String(req.user?.email || ''), userId: Number(req.user?.userId) || null, ipAddress: String(req.ip || ''), userAgent: String(req.headers['user-agent'] || ''), severity: 'INFO', detail: `Rifa ${raffleId} pospuesta hasta ${until} por número no vendido ${winningNumberRaw}`, entity: 'Raffle', entityId: String(raffleId), metadata: { until, reason } }); } catch (_e) {}
+
+      // Notificar al propietario de la rifa
+      try {
+        const owner = await prisma.user.findUnique({ where: { id: raffle.userId }, select: { id: true, email: true, pushToken: true, name: true } });
+        if (owner?.email) sendEmail(owner.email, `Rifa ${raffle.title} pospuesta`, `La resolución del número ${winningNumberRaw} ha sido pospuesta hasta ${until}. Razón: ${reason || 'No especificada'}.`).catch(console.error);
+      } catch (e) { console.error('[POSTPONE_NOTIFY]', e); }
+
+      return res.json({ message: 'Rifa pospuesta para re-evaluación', until });
+    }
+
+    // 3) Cerrar sin ganador
+    if (resolution === 'close_no_winner') {
+      const result = await closeRaffleInternal(raffleId, 'admin_closed_no_winner');
+      try { await securityLogger.log({ action: 'WINNER_RESOLVED_CLOSE_NO_WINNER', userEmail: String(req.user?.email || ''), userId: Number(req.user?.userId) || null, ipAddress: String(req.ip || ''), userAgent: String(req.headers['user-agent'] || ''), severity: 'INFO', detail: `Rifa ${raffleId} cerrada sin ganador por admin`, entity: 'Raffle', entityId: String(raffleId), metadata: { result } }); } catch (_e) {}
+      return res.json({ message: 'Rifa cerrada sin ganador', result });
+    }
+
+    // 4) Forzar ganador manualmente (crear ticket si hace falta)
+    if (resolution === 'force_manual') {
+      const ticketNumber = Number(params?.ticketNumber || tnum);
+      if (!Number.isFinite(ticketNumber)) return res.status(400).json({ error: 'Se requiere ticketNumber para force_manual' });
+      let ticketRec = await prisma.ticket.findFirst({ where: { raffleId, number: ticketNumber } });
+      if (!ticketRec) {
+        ticketRec = await prisma.ticket.create({ data: { raffleId, number: ticketNumber, status: 'manual' } });
+      }
+      const winner = await prisma.winner.create({ data: { raffleId, userId: ticketRec.userId || null, drawSlot: 'final', ticketNumber: ticketRec.number, prize: raffle.prize || null, photoUrl: null } });
+      try { await securityLogger.log({ action: 'WINNER_RESOLVED_FORCE', userEmail: String(req.user?.email || ''), userId: Number(req.user?.userId) || null, ipAddress: String(req.ip || ''), userAgent: String(req.headers['user-agent'] || ''), severity: 'WARN', detail: `Ganador forzado rifa ${raffleId} -> ticket ${ticketRec.number}`, entity: 'Raffle', entityId: String(raffleId), metadata: { method: 'force_manual', winnerId: winner.id } }); } catch (_e) {}
+      return res.json({ message: 'Ganador forzado manualmente', winner });
+    }
+
+    return res.status(400).json({ error: 'Resolución inválida' });
+  } catch (e) {
+    console.error('[RESOLVE_MISSING]', e);
+    return res.status(500).json({ error: 'Error al resolver número no vendido' });
   }
 });
 
@@ -7996,6 +8259,30 @@ async function startServer() {
     setTimeout(runCloseJob, 5 * 1000);
     setInterval(runCloseJob, Math.max(1, intervalMin) * 60 * 1000);
     console.log(`[RAFFLE_CLOSE_JOB] programado cada ${intervalMin} minutos`);
+
+    // Scheduler: revisar rifas pospuestas por número no vendido
+    try {
+      const postponeRecheckMin = Number(process.env.RAFFLE_POSTPONE_RECHECK_MINUTES) || 60;
+      let rechecking = false;
+      const runRecheckPostponed = async () => {
+        if (rechecking) return;
+        rechecking = true;
+        try {
+          console.log(`[RAFFLE_POSTPONE_JOB] iniciando re-evaluación de rifas pospuestas`);
+          const out = await reEvaluatePostponedRafflesBatch(200);
+          console.log(`[RAFFLE_POSTPONE_JOB] result: ${JSON.stringify(out)}`);
+        } catch (e) {
+          console.error('[RAFFLE_POSTPONE_JOB] Error:', e);
+        } finally {
+          rechecking = false;
+        }
+      };
+      setTimeout(runRecheckPostponed, 10 * 1000);
+      setInterval(runRecheckPostponed, Math.max(10, postponeRecheckMin) * 60 * 1000);
+      console.log(`[RAFFLE_POSTPONE_JOB] programado cada ${postponeRecheckMin} minutos`);
+    } catch (e) {
+      console.error('[RAFFLE_POSTPONE_JOB] no se pudo inicializar:', e);
+    }
   } catch (e) {
     console.error('[RAFFLE_CLOSE_JOB] no se pudo inicializar el scheduler:', e);
   }
