@@ -4912,8 +4912,11 @@ app.post('/admin/winners', authenticateToken, authorizeRole(['admin', 'superadmi
   }
 
   try {
+    // Información del actor (mejor registro para debugging)
     const actorRole = String(req.user?.role || '').toLowerCase();
     const actorId = req.user?.userId;
+    try { console.log('[ADMIN/WIN] actor:', { id: actorId, role: actorRole, user: req.user?.email || null }); } catch (e) {}
+    try { console.log('[ADMIN/WIN] payload:', { raffleId: rid, ticketNumber: ticketNumber, drawSlot: slot, prize: prize }); } catch (e) {}
 
     const raffle = await prisma.raffle.findUnique({
       where: { id: rid },
@@ -4922,7 +4925,10 @@ app.post('/admin/winners', authenticateToken, authorizeRole(['admin', 'superadmi
     if (!raffle) return res.status(404).json({ error: 'Rifa no encontrada' });
 
     // Admin solo puede declarar ganador de sus rifas.
-    if (actorRole !== 'superadmin' && raffle.userId !== actorId) {
+    // Compare IDs con coerción numérica para evitar mismatch string/number
+    const actorIdNum = Number(actorId);
+    const raffleOwnerIdNum = Number(raffle.userId);
+    if (actorRole !== 'superadmin' && raffleOwnerIdNum !== actorIdNum) {
       return res.status(403).json({ error: 'No autorizado para declarar ganador en esta rifa' });
     }
 
@@ -4938,11 +4944,34 @@ app.post('/admin/winners', authenticateToken, authorizeRole(['admin', 'superadmi
     if (existingSlot) return res.status(409).json({ error: `Ya existe ganador publicado para ${slot}` });
 
     // Punto clave anti-confusión: el ticket DEBE existir en ESA rifa (raffleId + number)
-    const ticket = await prisma.ticket.findFirst({
-      where: { raffleId: rid, number: tnum },
-      include: { user: { select: { id: true, name: true, email: true, avatar: true } } }
-    });
+    // Buscar ticket por número; si no se encuentra, intentar buscar por serialNumber (entrada manual posible)
+    let ticket = null;
+    try {
+      ticket = await prisma.ticket.findFirst({
+        where: { raffleId: rid, number: tnum },
+        include: { user: { select: { id: true, name: true, email: true, avatar: true } } }
+      });
+    } catch (e) {
+      console.error('[ADMIN/WIN] ticket lookup error (by number):', e);
+    }
+
     if (!ticket) {
+      // Intentar búsqueda alternativa por serialNumber (por si el admin pegó el ID/serial en vez del número)
+      try {
+        const serialCandidate = String(ticketNumber || '').trim();
+        if (serialCandidate) {
+          ticket = await prisma.ticket.findFirst({
+            where: { raffleId: rid, serialNumber: serialCandidate },
+            include: { user: { select: { id: true, name: true, email: true, avatar: true } } }
+          });
+        }
+      } catch (e) {
+        console.error('[ADMIN/WIN] ticket lookup error (by serial):', e);
+      }
+    }
+
+    if (!ticket) {
+      console.warn('[ADMIN/WIN] ticket not found', { raffleId: rid, ticketNumber: tnum, raw: ticketNumber });
       return res.status(404).json({ error: 'Ese número no existe como ticket comprado en esta rifa' });
     }
 
