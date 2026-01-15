@@ -7792,6 +7792,36 @@ async function startServer() {
     // No hacemos process.exit(1) para permitir ver los logs en Render
   }
 
+  // Scheduler: cerrar rifas expiradas periódicamente (evita depender solo de llamadas manuales)
+  try {
+    const intervalMin = Number(process.env.RAFFLE_CLOSE_INTERVAL_MINUTES) || 5; // cada 5 minutos por defecto
+    let closingInProgress = false;
+    const runCloseJob = async () => {
+      if (closingInProgress) return;
+      closingInProgress = true;
+      try {
+        console.log(`[RAFFLE_CLOSE_JOB] iniciando check de rifas vencidas (limit=200)`);
+        const out = await closeExpiredRafflesBatch(200);
+        if (out && out.closed) {
+          console.log(`[RAFFLE_CLOSE_JOB] cerrado: ${out.closed} de ${out.scanned} rifas escaneadas`);
+        } else {
+          console.log(`[RAFFLE_CLOSE_JOB] nada que cerrar (escaneadas=${out?.scanned || 0})`);
+        }
+      } catch (e) {
+        console.error('[RAFFLE_CLOSE_JOB] Error ejecutando job:', e);
+      } finally {
+        closingInProgress = false;
+      }
+    };
+
+    // Primera ejecución inmediata para cerrar lo pendiente al arrancar
+    setTimeout(runCloseJob, 5 * 1000);
+    setInterval(runCloseJob, Math.max(1, intervalMin) * 60 * 1000);
+    console.log(`[RAFFLE_CLOSE_JOB] programado cada ${intervalMin} minutos`);
+  } catch (e) {
+    console.error('[RAFFLE_CLOSE_JOB] no se pudo inicializar el scheduler:', e);
+  }
+
   // Graceful shutdown
   const shutdown = async (signal) => {
     console.log(`${signal} recibido. Cerrando servidor...`);
